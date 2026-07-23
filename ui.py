@@ -84,10 +84,13 @@ class App(tk.Tk):
         # 独立地址：留空则走默认 OWNER_WALLET；填写则覆盖并向下传递
         self.var_wallet = tk.StringVar(value="")
         self.var_no_proxy = tk.BooleanVar(value=True)
-        self.var_expand = tk.StringVar(value="有限递增")  # 有限递增 | 无限递增
+        self.var_expand = tk.StringVar(
+            value="无限递增" if vps.DEFAULT_INFINITE else "有限递增"
+        )  # 有限递增 | 无限递增
         self.var_product = tk.StringVar(value="Start Nodes")  # Start Nodes | Run Notebooks
         self.var_sku_mode = tk.StringVar(value="固定388")  # 固定388 | 递减回退
         self.var_sku_id = tk.StringVar(value=str(vps.DEFAULT_SKU_ID_FIXED))
+        self.var_require_captcha = tk.BooleanVar(value=False)  # 默认关闭腾讯打码
         self.var_remote_count = tk.StringVar(value=str(vps.DEFAULT_REMOTE_COUNT))
         self.var_remote_workers = tk.StringVar(value=str(vps.DEFAULT_REMOTE_WORKERS))
         self.var_schedule = tk.BooleanVar(value=False)
@@ -140,12 +143,15 @@ class App(tk.Tk):
         r = 3
         ttk.Label(top, text="独立钱包").grid(row=r, column=0, sticky=tk.W, **pad)
         ttk.Entry(top, textvariable=self.var_wallet).grid(
-            row=r, column=1, columnspan=5, sticky=tk.EW, **pad
+            row=r, column=1, columnspan=3, sticky=tk.EW, **pad
         )
+        ttk.Checkbutton(
+            top, text="强制打码(默认关)", variable=self.var_require_captcha
+        ).grid(row=r, column=4, columnspan=2, sticky=tk.W, **pad)
         r = 4
         ttk.Label(
             top,
-            text=f"SKU 固定=只开指定机型(默认388)；递减=高→低回退；钱包留空= {vps.OWNER_WALLET}",
+            text=f"默认无限递增；SKU固定388；打码默认关(协议可无ticket)；钱包留空= {vps.OWNER_WALLET}",
             foreground="#666",
         ).grid(row=r, column=1, columnspan=5, sticky=tk.W, padx=6, pady=(0, 4))
         top.columnconfigure(3, weight=1)
@@ -241,6 +247,8 @@ class App(tk.Tk):
             self.var_schedule.set(bool(data["schedule"]))
         if "run_on_start" in data:
             self.var_run_on_start.set(bool(data["run_on_start"]))
+        if "require_captcha" in data:
+            self.var_require_captcha.set(bool(data["require_captcha"]))
         if data.get("schedule"):
             self.after(800, self._start_schedule)
 
@@ -254,6 +262,7 @@ class App(tk.Tk):
             "product": self.var_product.get(),
             "sku_mode": self.var_sku_mode.get(),
             "sku_id": self.var_sku_id.get(),
+            "require_captcha": bool(self.var_require_captcha.get()),
             "remote_count": self.var_remote_count.get(),
             "remote_workers": self.var_remote_workers.get(),
             "schedule": bool(self.var_schedule.get()),
@@ -473,10 +482,11 @@ class App(tk.Tk):
         product_txt = "Run Notebooks" if product == "notebook" else "Start Nodes"
         wallet_src = "自定义" if params.get("wallet_custom") else "默认"
         sku_mode_txt = self.var_sku_mode.get()
+        captcha_txt = "强制打码" if self.var_require_captcha.get() else "不打码"
         self.log_q.put(
             f"===== 第{rnd}轮开始 ===== 并行中={active} 总数={count} 线程={workers} "
             f"模式={mode_txt} 产品={product_txt} SKU={sku_mode_txt}/{self.var_sku_id.get()} "
-            f"远程={remote_count}x{remote_workers} "
+            f"打码={captcha_txt} 远程={remote_count}x{remote_workers} "
             f"钱包({wallet_src})={wallet}"
         )
 
@@ -502,7 +512,7 @@ class App(tk.Tk):
                     "skip_register": False,
                     "register_prefix": "bohrium",
                     "mail_timeout": 90,
-                    "require_captcha": False,
+                    "require_captcha": bool(self.var_require_captcha.get()),
                     "sku_id": sku_id_val if sku_mode == "fixed" else (sku_id_val or None),
                     "sku_mode": sku_mode,
                     "image_id": vps.DEFAULT_IMAGE_ID,

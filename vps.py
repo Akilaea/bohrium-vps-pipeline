@@ -73,7 +73,7 @@ DEFAULT_REPO = (
 )
 DEFAULT_MODE = "bootstrap"  # bootstrap | mine
 DEFAULT_PRODUCT = "node"  # node=Start Nodes 容器；notebook=Run Notebooks
-DEFAULT_INFINITE = False  # True: 子机继续 bootstrap 无限递增；False: 子机仅 mine
+DEFAULT_INFINITE = True  # True: 子机继续 bootstrap 无限递增；False: 子机仅 mine
 # fixed=只开指定 sku；desc=高配→低配递减回退
 DEFAULT_SKU_MODE = "fixed"
 DEFAULT_SKU_ID_FIXED = 388  # 新号免费额度友好
@@ -946,12 +946,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--infinite",
         action="store_true",
         default=DEFAULT_INFINITE,
-        help="开启无限递增：子机继续 bootstrap 再开号（默认关闭，子机仅挖矿）",
+        help="开启无限递增：子机继续 bootstrap 再开号（默认开启）",
     )
     p.add_argument(
         "--no-infinite",
         action="store_true",
-        help="关闭无限递增（默认行为，可显式指定）",
+        help="关闭无限递增（子机仅挖矿）",
     )
     p.add_argument("--wait-ssh", type=float, default=180.0, help="等待 SSH 超时秒数")
     p.add_argument("--ssh-port", type=int, default=22)
