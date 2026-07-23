@@ -61,7 +61,10 @@ DEFAULT_SKU_ID = 419
 DEFAULT_SKU_LABEL = "sku-419"
 DEFAULT_DISK = 20
 DEFAULT_IMAGE_ID = 37611
+# container = 容器（默认，轻量）；vm = 虚拟机
 DEFAULT_DEVICE = "container"
+DEVICE_CONTAINER = "container"
+DEVICE_VM = "vm"
 DEFAULT_PLATFORM = "ali"
 DEFAULT_TURNOFF_AFTER = -1
 DEFAULT_PROJECT_ID = None  # each account has its own default project
@@ -235,22 +238,39 @@ class BohriumNodeClient:
         return self.post("/bohrapi/v1/node/add", payload)
 
     def node_release(self, node_id: int) -> dict[str, Any]:
-        """Best-effort release/stop of a stuck node so SKU fallback can continue."""
+        """Best-effort release/stop of a stuck node so SKU fallback can continue.
+
+        Bohrium accepts several payload shapes; creating nodes (status=1, no IP)
+        often need force/releaseType fields, otherwise they keep counting toward
+        the 2-nodes-per-project quota.
+        """
         nid = int(node_id)
         last: dict[str, Any] = {}
-        for path, body in (
-            ("/bohrapi/v1/node/release", {"id": nid, "nodeId": nid}),
-            ("/bohrapi/v1/node/delete", {"id": nid, "nodeId": nid}),
-            ("/bohrapi/v1/node/stop", {"id": nid, "nodeId": nid}),
-            ("/bohrapi/v1/node/batchRelease", {"ids": [nid], "nodeIds": [nid]}),
-            (f"/bohrapi/v1/node/{nid}/release", {"id": nid}),
-            (f"/bohrapi/v1/node/{nid}/stop", {"id": nid}),
-            (f"/bohrapi/v1/node/{nid}/delete", {"id": nid}),
-        ):
+        candidates: list[tuple[str, dict[str, Any]]] = [
+            ("/bohrapi/v1/node/release", {"nodeId": nid}),
+            ("/bohrapi/v1/node/release", {"id": nid}),
+            ("/bohrapi/v1/node/release", {"nodeId": nid, "force": True}),
+            ("/bohrapi/v1/node/release", {"id": nid, "force": True}),
+            ("/bohrapi/v1/node/release", {"nodeId": nid, "releaseType": 1}),
+            ("/bohrapi/v1/node/release", {"nodeIds": [nid]}),
+            ("/bohrapi/v1/node/release", {"ids": [nid]}),
+            ("/bohrapi/v1/node/batchRelease", {"nodeIds": [nid]}),
+            ("/bohrapi/v1/node/batchRelease", {"ids": [nid]}),
+            ("/bohrapi/v1/node/delete", {"nodeId": nid}),
+            ("/bohrapi/v1/node/delete", {"id": nid}),
+            ("/bohrapi/v1/node/stop", {"nodeId": nid}),
+            ("/bohrapi/v1/node/shutdown", {"nodeId": nid}),
+            ("/bohrapi/v1/node/turnoff", {"nodeId": nid, "turnoffAfter": 0}),
+            (f"/bohrapi/v1/node/{nid}/release", {"nodeId": nid}),
+            (f"/bohrapi/v1/node/{nid}/stop", {"nodeId": nid}),
+            (f"/bohrapi/v1/node/{nid}/delete", {"nodeId": nid}),
+        ]
+        for path, body in candidates:
             try:
                 last = self.post(path, body)
-                LOG.info("node release try %s -> %s", path, last)
-                if int(last.get("code", -1)) == 0:
+                code = int(last.get("code", -1))
+                LOG.info("node release try %s %s -> code=%s", path, body, code)
+                if code == 0:
                     return last
             except Exception as exc:  # noqa: BLE001
                 LOG.debug("release %s failed: %s", path, exc)
@@ -293,17 +313,32 @@ def release_unready_nodes(
         nid = int(item.get("nodeId") or item.get("id") or 0)
         if not nid:
             continue
+        # Ready nodes (have IP+pwd): keep when keep_ready=True
         if keep_ready and credentials_ready(item):
             continue
-        LOG.warning("releasing unready node id=%s status=%s", nid, item.get("status"))
+        # status=1 often means "creating"; without IP/pwd they still count toward
+        # the 2-node project quota and must be force-released.
+        st = item.get("status")
+        LOG.warning(
+            "releasing unready node id=%s status=%s device=%s ip=%s",
+            nid,
+            st,
+            item.get("device"),
+            item.get("ip") or "-",
+        )
         try:
-            client.node_release(nid)
-            released += 1
-            time.sleep(0.35)  # soft pace
+            resp = client.node_release(nid)
+            ok = int((resp or {}).get("code", -1)) == 0
+            if ok:
+                released += 1
+            else:
+                LOG.warning("release node %s not confirmed: %s", nid, resp)
+            time.sleep(0.5)
         except Exception as exc:  # noqa: BLE001
             LOG.warning("release unready %s failed: %s", nid, exc)
     if released:
-        time.sleep(2.0)
+        # Creating nodes may need a moment before quota frees up
+        time.sleep(3.0)
     return released
 
 
@@ -787,6 +822,14 @@ def _sku_fail_is_capacity(msg: str, code: int) -> bool:
     return code in {140404, 500}
 
 
+def normalize_device(device: str | None) -> str:
+    """Map UI/CLI labels to API device string. Default: container."""
+    d = (device or DEFAULT_DEVICE).strip().lower()
+    if d in {"vm", "virtual", "virtualmachine", "虚拟机", "kvm"}:
+        return DEVICE_VM
+    return DEVICE_CONTAINER
+
+
 def create_node(
     *,
     token: str,
@@ -805,6 +848,7 @@ def create_node(
     sku_fallback: bool = True,
     wait_timeout: float = 120.0,
 ) -> CreateNodeResult:
+    device = normalize_device(device)
     client = BohriumNodeClient(token, proxy=proxy)
     try:
         info = client.account_info()
@@ -1160,7 +1204,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--image-id", type=int, default=DEFAULT_IMAGE_ID, help="image id from create form (default 37611)")
     p.add_argument("--version-id", type=int, default=None, help="image version id under image family")
     p.add_argument("--image-name", default=None, help="match version by url/version string")
-    p.add_argument("--device", default=DEFAULT_DEVICE, help='backend device string, verified: "container"')
+    p.add_argument(
+        "--device",
+        default=DEFAULT_DEVICE,
+        choices=[DEVICE_CONTAINER, DEVICE_VM, "container", "vm"],
+        help='运行形态：container=容器（默认），vm=虚拟机',
+    )
     p.add_argument("--dry-run", action="store_true", help="only resolve sku/image/payload, do not create")
     p.add_argument("--no-wait", action="store_true", help="do not poll node list after create")
     p.add_argument("--list-only", action="store_true", help="only list current nodes and prices")

@@ -734,7 +734,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--disk-size", type=int, default=DEFAULT_DISK)
     p.add_argument("--project-id", type=int, default=None, help="项目ID，默认按账号自动选择")
     p.add_argument("--name", default=None, help="节点名前缀，默认自动生成")
-    p.add_argument("--device", default=DEFAULT_DEVICE)
+    p.add_argument(
+        "--device",
+        default=DEFAULT_DEVICE,
+        choices=["container", "vm"],
+        help="运行形态：container=容器（默认），vm=虚拟机",
+    )
     p.add_argument("--platform", default=DEFAULT_PLATFORM)
     p.add_argument("--turnoff-after", type=int, default=DEFAULT_TURNOFF_AFTER)
 
