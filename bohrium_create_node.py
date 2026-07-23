@@ -164,9 +164,12 @@ class BohriumNodeClient:
         last: dict[str, Any] = {}
         for path, body in (
             ("/bohrapi/v1/node/release", {"id": nid, "nodeId": nid}),
+            ("/bohrapi/v1/node/delete", {"id": nid, "nodeId": nid}),
             ("/bohrapi/v1/node/stop", {"id": nid, "nodeId": nid}),
+            ("/bohrapi/v1/node/batchRelease", {"ids": [nid], "nodeIds": [nid]}),
             (f"/bohrapi/v1/node/{nid}/release", {"id": nid}),
             (f"/bohrapi/v1/node/{nid}/stop", {"id": nid}),
+            (f"/bohrapi/v1/node/{nid}/delete", {"id": nid}),
         ):
             try:
                 last = self.post(path, body)
@@ -180,6 +183,35 @@ class BohriumNodeClient:
 
     def balance(self) -> dict[str, Any]:
         return self.get("/bohrapi/v1/account/user/integral")
+
+
+def release_unready_nodes(client: BohriumNodeClient, *, keep_ready: bool = True) -> int:
+    """Release nodes that have no IP/password (stuck / quota fillers).
+
+    When keep_ready=True, only release nodes without usable credentials.
+    """
+    released = 0
+    try:
+        data = client.node_list(queryType="private", orderBy="startTimeDesc")
+        items = ((data.get("data") or {}).get("items") or [])
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("list nodes for release failed: %s", exc)
+        return 0
+    for item in items:
+        nid = int(item.get("nodeId") or item.get("id") or 0)
+        if not nid:
+            continue
+        if keep_ready and credentials_ready(item):
+            continue
+        LOG.warning("releasing unready node id=%s status=%s", nid, item.get("status"))
+        try:
+            client.node_release(nid)
+            released += 1
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("release unready %s failed: %s", nid, exc)
+    if released:
+        time.sleep(2.0)
+    return released
 
 
 def load_token(path: Path | None = None, token: str | None = None) -> str:
@@ -564,7 +596,21 @@ def wait_node(
     return last
 
 
+def _is_quota_limit(msg: str, code: int) -> bool:
+    """Same-project node cap (e.g. max 2 nodes). Do NOT treat as balance retry."""
+    if code == 140111:
+        return True
+    m = (msg or "").lower()
+    return (
+        "maximum number of your nodes" in m
+        or "max" in m and "node" in m and "project" in m
+        or "最多" in (msg or "") and "节点" in (msg or "")
+    )
+
+
 def _sku_fail_is_capacity(msg: str, code: int) -> bool:
+    if _is_quota_limit(msg, code):
+        return True
     m = (msg or "").lower()
     keys = (
         "insufficient",
@@ -585,7 +631,7 @@ def _sku_fail_is_capacity(msg: str, code: int) -> bool:
     )
     if any(k in m for k in keys):
         return True
-    # business codes that often mean capacity / schedule fail
+    # business codes that often mean capacity / schedule fail (not 140111)
     return code in {148888, 140404, 500, 400}
 
 
@@ -766,7 +812,21 @@ def create_node(
                 if code == 0:
                     break
                 msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
-                if code in {148888, 140404} or "balance" in msg.lower() or "project" in msg.lower():
+                # Quota: release stuck nodes once, retry add at most once — never spam
+                if _is_quota_limit(msg, code):
+                    n = release_unready_nodes(client, keep_ready=True)
+                    LOG.warning(
+                        "node quota hit code=%s (released unready=%s); %s",
+                        code,
+                        n,
+                        "retry once" if attempt == 1 else "stop sku",
+                    )
+                    if attempt == 1 and n > 0:
+                        time.sleep(3.0)
+                        continue
+                    break
+                # Balance / new-account race only (do NOT match generic "project")
+                if code in {148888, 140404} or "balance" in msg.lower() or "recharge" in msg.lower():
                     LOG.warning("node/add transient code=%s msg=%s; retry", code, msg)
                     time.sleep(2.0 * attempt)
                     try:
@@ -785,6 +845,10 @@ def create_node(
             if code != 0:
                 msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
                 errors.append(f"sku={sid} add_fail: {msg}")
+                # Quota: after cleanup still fail → further lower SKUs won't help, stop
+                if _is_quota_limit(msg, code):
+                    LOG.warning("project node quota still hit after cleanup; stop sku fallback")
+                    break
                 if sku_fallback and _sku_fail_is_capacity(msg, code) and idx < len(sku_try):
                     LOG.warning("sku=%s unavailable, try next lower spec", sid)
                     continue
