@@ -15,6 +15,9 @@ vps_result.json
 ssh_run_result.json
 vps_runs/
 ui_config.json
+sku_map.json
+_sku_*.json
+_tmp_*.py
 *.json.bak
 
 # build

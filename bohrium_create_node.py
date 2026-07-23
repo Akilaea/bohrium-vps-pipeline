@@ -432,39 +432,93 @@ def wait_account_ready(
     raise RuntimeError(f"account not ready within {int(timeout)}s: {last_err}")
 
 
-# Web create page shows more SKUs than cpuList for new free accounts.
-# Verified live create: sku 419 -> c64_m128_cpu (64C/128G).
-# cpuList for new accounts is often truncated to only c2..c32; higher IDs still
-# accept price query / node/add, so we inject preferred high-end IDs.
-KNOWN_CPU_SKU_SPECS: dict[int, tuple[str, int, float]] = {
-    # high-end (often missing from new-account cpuList)
-    # labels for non-419 are best-effort mapping by price band + historical usage;
-    # create will still fall through if a guess is wrong.
-    420: ("c64_m64_cpu", 64, 64.0),
-    419: ("c64_m128_cpu", 64, 128.0),  # verified
-    422: ("c64_m256_cpu", 64, 256.0),
-    424: ("c64_m512_cpu", 64, 512.0),
-    428: ("c52_m96_cpu", 52, 96.0),
-    434: ("c52_m384_cpu", 52, 384.0),
-    # standard filtered list (from cpuList)
-    391: ("c32_m128_cpu", 32, 128.0),
-    371: ("c16_m32_cpu", 16, 32.0),
-    427: ("c8_m16_cpu", 8, 16.0),
-    409: ("c4_m8_cpu", 4, 8.0),
-    388: ("c2_m4_cpu", 2, 4.0),
+# Verified by create+node_detail probe (2026-07-23). NO guesses.
+# Format: skuId -> (spec_label, cpu, mem_gb, is_gpu)
+VERIFIED_SKU_SPECS: dict[int, tuple[str, int, float, bool]] = {
+    # pure CPU (mining preferred)
+    424: ("c64_m64_cpu", 64, 64.0, False),
+    419: ("c64_m128_cpu", 64, 128.0, False),
+    422: ("c64_m256_cpu", 64, 256.0, False),
+    391: ("c32_m128_cpu", 32, 128.0, False),
+    371: ("c16_m32_cpu", 16, 32.0, False),
+    434: ("c8_m8_cpu", 8, 8.0, False),
+    427: ("c8_m16_cpu", 8, 16.0, False),
+    409: ("c4_m8_cpu", 4, 8.0, False),
+    388: ("c2_m4_cpu", 2, 4.0, False),
+    # GPU (excluded when cpu_only=True)
+    428: ("c8_m31_1 * NVIDIA T4", 8, 31.0, True),
+    372: ("c16_m62_1 * NVIDIA T4", 16, 62.0, True),
+    365: ("c12_m92_1 * NVIDIA V100", 12, 92.0, True),
+    390: ("c32_m128_4 * NVIDIA V100", 32, 128.0, True),
+    421: ("c64_m256_8 * NVIDIA V100", 64, 256.0, True),
+    426: ("c82_m336_8 * NVIDIA V100", 82, 336.0, True),
+    402: ("c48_m368_4 * NVIDIA V100", 48, 368.0, True),
+    438: ("c96_m372_4 * NVIDIA T4", 96, 372.0, True),
 }
 
-# Only inject known high-end IDs (not random price-valid GPU/other skus).
-EXTRA_CPU_SKU_IDS: list[int] = [420, 428, 434, 419, 422, 424]
+# Pure-CPU ids to inject when resources.cpuList is truncated for new accounts.
+EXTRA_CPU_SKU_IDS: list[int] = [424, 419, 422, 391, 371, 434, 427, 409, 388]
+
+# Runtime-learned map next to app (skuId -> {spec,cpu,memory,gpu})
+SKU_MAP_PATH = ROOT / "sku_map.json"
+
+
+def load_learned_sku_map() -> dict[int, dict[str, Any]]:
+    """Load runtime-learned sku map from disk (merged with VERIFIED)."""
+    out: dict[int, dict[str, Any]] = {}
+    for sid, (label, cpu, mem, is_gpu) in VERIFIED_SKU_SPECS.items():
+        out[sid] = {"label": label, "cpu": cpu, "mem": mem, "gpu": is_gpu, "source": "verified"}
+    try:
+        if SKU_MAP_PATH.is_file():
+            raw = json.loads(SKU_MAP_PATH.read_text(encoding="utf-8"))
+            for k, v in (raw or {}).items():
+                try:
+                    sid = int(k)
+                except Exception:
+                    continue
+                if not isinstance(v, dict):
+                    continue
+                out[sid] = {
+                    "label": str(v.get("label") or v.get("spec") or f"sku-{sid}"),
+                    "cpu": int(v.get("cpu") or 0),
+                    "mem": float(v.get("mem") or v.get("memory") or 0),
+                    "gpu": bool(v.get("gpu") or ("NVIDIA" in str(v.get("label") or "") or "GPU" in str(v.get("label") or "").upper())),
+                    "source": "learned",
+                }
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("load sku_map failed: %s", exc)
+    return out
+
+
+def remember_sku_spec(sku_id: int, *, label: str, cpu: int, mem: float, gpu: bool = False) -> None:
+    """Persist observed node detail so ranking never relies on guesses."""
+    sid = int(sku_id)
+    try:
+        data: dict[str, Any] = {}
+        if SKU_MAP_PATH.is_file():
+            data = json.loads(SKU_MAP_PATH.read_text(encoding="utf-8")) or {}
+        data[str(sid)] = {
+            "label": label,
+            "spec": label,
+            "cpu": int(cpu or 0),
+            "mem": float(mem or 0),
+            "memory": float(mem or 0),
+            "gpu": bool(gpu),
+        }
+        SKU_MAP_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        LOG.info("learned sku map %s => %s c%s m%s gpu=%s", sid, label, cpu, mem, gpu)
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("remember sku failed: %s", exc)
 
 
 def list_skus(client: BohriumNodeClient, *, disk: int = DEFAULT_DISK) -> list[dict[str, Any]]:
     """Fetch SKUs. Uses same endpoint as web UI: GET /bohrapi/v1/node/resources.
 
     NOTE: For brand-new free accounts, backend often returns only 5 small CPU
-    SKUs (up to c32_m128). Higher SKUs (c64/c52...) still work via node/add if
-    we inject known skuIds — see EXTRA_CPU_SKU_IDS / KNOWN_CPU_SKU_SPECS.
+    SKUs (up to c32_m128). Higher pure-CPU SKUs still work via node/add if we
+    inject EXTRA_CPU_SKU_IDS (verified by create+detail probe).
     """
+    learned = load_learned_sku_map()
     # Match frontend Pan({nodeType, isNotebookStart, creatorId, diskSize})
     creator_id = None
     try:
@@ -481,7 +535,6 @@ def list_skus(client: BohriumNodeClient, *, disk: int = DEFAULT_DISK) -> list[di
         params["creatorId"] = creator_id
     data = client.get("/bohrapi/v1/node/resources", params=params)
     if int(data.get("code", -1)) != 0:
-        # fallback bare call
         data = client.resources()
     if int(data.get("code", -1)) != 0:
         raise RuntimeError(f"resources failed: {data}")
@@ -490,14 +543,19 @@ def list_skus(client: BohriumNodeClient, *, disk: int = DEFAULT_DISK) -> list[di
     for item in body.get("cpuList") or []:
         sid = int(item.get("value"))
         label = str(item.get("label") or "")
-        if sid in KNOWN_CPU_SKU_SPECS:
-            label = KNOWN_CPU_SKU_SPECS[sid][0]
+        if sid in learned:
+            label = str(learned[sid].get("label") or label)
         out.append({"kind": "cpu", "label": label, "skuId": sid, **item})
     for item in body.get("gpuList") or []:
-        out.append({"kind": "gpu", "label": item.get("label"), "skuId": int(item.get("value")), **item})
+        sid = int(item.get("value"))
+        label = str(item.get("label") or "")
+        if sid in learned:
+            label = str(learned[sid].get("label") or label)
+        out.append({"kind": "gpu", "label": label, "skuId": sid, **item})
     LOG.info(
-        "resources cpuList=%s (raw from API; high-end may be missing for this account)",
+        "resources cpuList=%s gpuList=%s",
         [(x.get("skuId"), x.get("label")) for x in out if x.get("kind") == "cpu"],
+        [(x.get("skuId"), x.get("label")) for x in out if x.get("kind") == "gpu"],
     )
     return out
 
@@ -563,21 +621,29 @@ def list_skus_ranked(
     Exhausts all machines in a CPU tier before dropping to the next lower tier.
     Injects EXTRA_CPU_SKU_IDS when cpuList is truncated for new accounts.
     """
+    learned = load_learned_sku_map()
     skus = list_skus(client, disk=disk)
     gpu_ids = {int(s["skuId"]) for s in skus if str(s.get("kind") or "").lower() == "gpu"}
+    # also treat verified GPU skus as GPU even if only injected via map
+    for sid, meta in learned.items():
+        if meta.get("gpu"):
+            gpu_ids.add(int(sid))
+
     if cpu_only:
         skus = [s for s in skus if str(s.get("kind") or "").lower() != "gpu"]
 
     by_id: dict[int, dict[str, Any]] = {int(s["skuId"]): dict(s) for s in skus}
 
-    # Inject high-end candidates missing from truncated cpuList
+    # Inject verified pure-CPU high-end ids missing from truncated cpuList
     for sid in EXTRA_CPU_SKU_IDS:
         if sid in by_id or sid in gpu_ids:
             continue
-        if sid in KNOWN_CPU_SKU_SPECS:
-            label, cpu, mem = KNOWN_CPU_SKU_SPECS[sid]
-        else:
-            label, cpu, mem = f"sku-{sid}", 0, 0.0
+        meta = learned.get(sid) or {}
+        if meta.get("gpu"):
+            continue
+        label = str(meta.get("label") or f"sku-{sid}")
+        cpu = int(meta.get("cpu") or 0)
+        mem = float(meta.get("mem") or 0)
         by_id[sid] = {
             "kind": "cpu",
             "skuId": sid,
@@ -587,29 +653,38 @@ def list_skus_ranked(
             "injected": True,
         }
 
-    # optional explicit preferred sku
     if preferred_sku_id is not None and int(preferred_sku_id) not in by_id:
         sid = int(preferred_sku_id)
-        if sid in KNOWN_CPU_SKU_SPECS:
-            label, cpu, mem = KNOWN_CPU_SKU_SPECS[sid]
-        else:
-            label, cpu, mem = f"sku-{sid}", 0, 0.0
-        by_id[sid] = {"kind": "cpu", "skuId": sid, "label": label, "cpu": cpu, "mem": mem, "injected": True}
+        meta = learned.get(sid) or {}
+        by_id[sid] = {
+            "kind": "gpu" if meta.get("gpu") else "cpu",
+            "skuId": sid,
+            "label": str(meta.get("label") or f"sku-{sid}"),
+            "cpu": int(meta.get("cpu") or 0),
+            "mem": float(meta.get("mem") or 0),
+            "injected": True,
+        }
 
     ranked: list[dict[str, Any]] = []
     for sid, sku in by_id.items():
-        label = str(sku.get("label") or "")
-        if sid in KNOWN_CPU_SKU_SPECS:
-            label, known_cpu, known_mem = KNOWN_CPU_SKU_SPECS[sid]
-            cpu, mem = known_cpu, known_mem
+        meta = learned.get(sid)
+        if cpu_only and (sid in gpu_ids or (meta and meta.get("gpu"))):
+            continue
+        if meta:
+            label = str(meta.get("label") or sku.get("label") or f"sku-{sid}")
+            cpu = int(meta.get("cpu") or 0)
+            mem = float(meta.get("mem") or 0)
         else:
+            label = str(sku.get("label") or "")
             cpu, mem = parse_sku_spec({**sku, "label": label})
+        # skip pure-unknown injects with no cpu info
+        if sku.get("injected") and cpu <= 0:
+            continue
         price_val = 0.0
         price_str = ""
         try:
             price_resp = client.resource_price(sid, project_id, disk=disk)
             if int(price_resp.get("code", -1)) != 0:
-                # skip injects that are invalid for this account
                 if sku.get("injected"):
                     LOG.debug("skip inject sku=%s price fail: %s", sid, price_resp)
                     continue
@@ -628,19 +703,21 @@ def list_skus_ranked(
             "price": price_str,
             "price_val": price_val,
             "label": label or f"sku-{sid}",
+            "gpu": bool(meta.get("gpu")) if meta else ("NVIDIA" in label or "GPU" in label.upper()),
         }
         ranked.append(row)
         LOG.info(
-            "sku candidate id=%s label=%s cpu=%s mem=%s price=%s injected=%s",
+            "sku candidate id=%s label=%s cpu=%s mem=%s price=%s gpu=%s injected=%s",
             sid,
             row["label"],
             cpu,
             mem,
             price_str or "-",
+            row["gpu"],
             bool(sku.get("injected")),
         )
 
-    # Tier by CPU desc; within tier mem asc (mining prefers cores, not RAM)
+    # CPU high→low; within tier mem low→high (mining prefers cores)
     ranked.sort(
         key=lambda x: (
             -int(x.get("cpu") or 0),
@@ -650,7 +727,7 @@ def list_skus_ranked(
         )
     )
     LOG.info(
-        "sku order (cpu high→low, mem low→high): %s",
+        "sku order (cpu high→low, mem low→high, pure-CPU): %s",
         ", ".join(
             f"{x['skuId']}({x.get('label')}|c{x.get('cpu')}m{int(x.get('mem') or 0)})"
             for x in ranked[:20]
@@ -1220,6 +1297,22 @@ def create_node(
                     client, node_id, timeout=to, interval=4, require_credentials=True
                 )
                 LOG.info("node info: %s", json.dumps(node_info or {}, ensure_ascii=False)[:500])
+            # Learn real spec from detail ASAP (even if IP never arrives)
+            if node_info:
+                real_spec = str(node_info.get("spec") or "")
+                real_cpu = int(node_info.get("cpu") or 0)
+                real_mem = float(node_info.get("memory") or 0)
+                if real_spec or real_cpu:
+                    is_gpu = "NVIDIA" in real_spec or "GPU" in real_spec.upper() or bool(node_info.get("gpu") and str(node_info.get("gpu")) not in {"", "-", "0", "None"})
+                    remember_sku_spec(
+                        sid,
+                        label=real_spec or label,
+                        cpu=real_cpu,
+                        mem=real_mem,
+                        gpu=is_gpu,
+                    )
+                    if real_spec:
+                        label = real_spec
             creds = extract_credentials(node_info)
             if creds.get("ip") and creds.get("password"):
                 status_val = creds.get("status")
