@@ -432,16 +432,89 @@ def wait_account_ready(
     raise RuntimeError(f"account not ready within {int(timeout)}s: {last_err}")
 
 
-def list_skus(client: BohriumNodeClient) -> list[dict[str, Any]]:
-    data = client.resources()
+# Web create page shows more SKUs than cpuList for new free accounts.
+# Verified live create: sku 419 -> c64_m128_cpu (64C/128G).
+# cpuList for new accounts is often truncated to only c2..c32; higher IDs still
+# accept price query / node/add, so we inject preferred high-end IDs.
+KNOWN_CPU_SKU_SPECS: dict[int, tuple[str, int, float]] = {
+    # high-end (often missing from new-account cpuList)
+    # labels for non-419 are best-effort mapping by price band + historical usage;
+    # create will still fall through if a guess is wrong.
+    420: ("c64_m64_cpu", 64, 64.0),
+    419: ("c64_m128_cpu", 64, 128.0),  # verified
+    422: ("c64_m256_cpu", 64, 256.0),
+    424: ("c64_m512_cpu", 64, 512.0),
+    428: ("c52_m96_cpu", 52, 96.0),
+    434: ("c52_m384_cpu", 52, 384.0),
+    # standard filtered list (from cpuList)
+    391: ("c32_m128_cpu", 32, 128.0),
+    371: ("c16_m32_cpu", 16, 32.0),
+    427: ("c8_m16_cpu", 8, 16.0),
+    409: ("c4_m8_cpu", 4, 8.0),
+    388: ("c2_m4_cpu", 2, 4.0),
+}
+
+# User priority: c64_m64 -> c52_m96 -> c52_m384 -> other high -> lower
+PREFERRED_CPU_LABEL_ORDER: list[str] = [
+    "c64_m64_cpu",
+    "c52_m96_cpu",
+    "c52_m384_cpu",
+    "c64_m128_cpu",
+    "c64_m256_cpu",
+    "c64_m512_cpu",
+    "c32_m256_cpu",
+    "c32_m128_cpu",
+    "c16_m32_cpu",
+    "c8_m16_cpu",
+    "c4_m8_cpu",
+    "c2_m4_cpu",
+]
+
+# Only inject known high-end IDs (not random price-valid GPU/other skus).
+EXTRA_CPU_SKU_IDS: list[int] = [420, 428, 434, 419, 422, 424]
+
+
+def list_skus(client: BohriumNodeClient, *, disk: int = DEFAULT_DISK) -> list[dict[str, Any]]:
+    """Fetch SKUs. Uses same endpoint as web UI: GET /bohrapi/v1/node/resources.
+
+    NOTE: For brand-new free accounts, backend often returns only 5 small CPU
+    SKUs (up to c32_m128). Higher SKUs (c64/c52...) still work via node/add if
+    we inject known skuIds — see EXTRA_CPU_SKU_IDS / KNOWN_CPU_SKU_SPECS.
+    """
+    # Match frontend Pan({nodeType, isNotebookStart, creatorId, diskSize})
+    creator_id = None
+    try:
+        info = client.account_info()
+        creator_id = (info.get("data") or {}).get("userId")
+    except Exception:
+        pass
+    params: dict[str, Any] = {
+        "nodeType": 1,
+        "isNotebookStart": False,
+        "diskSize": int(disk),
+    }
+    if creator_id is not None:
+        params["creatorId"] = creator_id
+    data = client.get("/bohrapi/v1/node/resources", params=params)
+    if int(data.get("code", -1)) != 0:
+        # fallback bare call
+        data = client.resources()
     if int(data.get("code", -1)) != 0:
         raise RuntimeError(f"resources failed: {data}")
     body = data.get("data") or {}
     out: list[dict[str, Any]] = []
     for item in body.get("cpuList") or []:
-        out.append({"kind": "cpu", "label": item.get("label"), "skuId": int(item.get("value")), **item})
+        sid = int(item.get("value"))
+        label = str(item.get("label") or "")
+        if sid in KNOWN_CPU_SKU_SPECS:
+            label = KNOWN_CPU_SKU_SPECS[sid][0]
+        out.append({"kind": "cpu", "label": label, "skuId": sid, **item})
     for item in body.get("gpuList") or []:
         out.append({"kind": "gpu", "label": item.get("label"), "skuId": int(item.get("value")), **item})
+    LOG.info(
+        "resources cpuList=%s (raw from API; high-end may be missing for this account)",
+        [(x.get("skuId"), x.get("label")) for x in out if x.get("kind") == "cpu"],
+    )
     return out
 
 
@@ -484,11 +557,7 @@ def parse_sku_spec(sku: dict[str, Any]) -> tuple[int, float]:
     m = re.search(r"(\d+(?:\.\d+)?)\s*[Gg](?:i?B)?", text)
     if m and mem <= 0:
         mem = float(m.group(1))
-    if cpu <= 0:
-        try:
-            cpu = int(sku.get("skuId") or 0) % 1000
-        except Exception:
-            cpu = 0
+    # Do NOT invent cores from skuId (e.g. sku-401 -> 401 cores is wrong)
     return cpu, mem
 
 
@@ -500,23 +569,74 @@ def list_skus_ranked(
     cpu_only: bool = True,
     preferred_sku_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch SKUs and sort high-spec → low-spec (cpu, mem, price desc)."""
-    skus = list_skus(client)
+    """Fetch SKUs and sort: user preferred labels, then high-spec → low-spec.
+
+    Critical: API cpuList for new accounts is truncated (only up to c32). We inject
+    EXTRA_CPU_SKU_IDS (e.g. 419=c64_m128, 420=c64_m64, 428=c52_m96...) after price
+    validation so create can still target 64C/52C machines.
+    """
+    skus = list_skus(client, disk=disk)
+    gpu_ids = {int(s["skuId"]) for s in skus if str(s.get("kind") or "").lower() == "gpu"}
     if cpu_only:
         skus = [s for s in skus if str(s.get("kind") or "").lower() != "gpu"]
+
+    by_id: dict[int, dict[str, Any]] = {int(s["skuId"]): dict(s) for s in skus}
+
+    # Inject high-end candidates missing from truncated cpuList
+    for sid in EXTRA_CPU_SKU_IDS:
+        if sid in by_id or sid in gpu_ids:
+            continue
+        if sid in KNOWN_CPU_SKU_SPECS:
+            label, cpu, mem = KNOWN_CPU_SKU_SPECS[sid]
+        else:
+            label, cpu, mem = f"sku-{sid}", 0, 0.0
+        by_id[sid] = {
+            "kind": "cpu",
+            "skuId": sid,
+            "label": label,
+            "cpu": cpu,
+            "mem": mem,
+            "injected": True,
+        }
+
+    # optional explicit preferred sku
+    if preferred_sku_id is not None and int(preferred_sku_id) not in by_id:
+        sid = int(preferred_sku_id)
+        if sid in KNOWN_CPU_SKU_SPECS:
+            label, cpu, mem = KNOWN_CPU_SKU_SPECS[sid]
+        else:
+            label, cpu, mem = f"sku-{sid}", 0, 0.0
+        by_id[sid] = {"kind": "cpu", "skuId": sid, "label": label, "cpu": cpu, "mem": mem, "injected": True}
+
     ranked: list[dict[str, Any]] = []
-    for sku in skus:
-        sid = int(sku["skuId"])
-        cpu, mem = parse_sku_spec(sku)
+    for sid, sku in by_id.items():
+        label = str(sku.get("label") or "")
+        if sid in KNOWN_CPU_SKU_SPECS:
+            label, known_cpu, known_mem = KNOWN_CPU_SKU_SPECS[sid]
+            cpu, mem = known_cpu, known_mem
+        else:
+            cpu, mem = parse_sku_spec({**sku, "label": label})
         price_val = 0.0
         price_str = ""
         try:
             price_resp = client.resource_price(sid, project_id, disk=disk)
-            if int(price_resp.get("code", -1)) == 0:
+            if int(price_resp.get("code", -1)) != 0:
+                # skip injects that are invalid for this account
+                if sku.get("injected"):
+                    LOG.debug("skip inject sku=%s price fail: %s", sid, price_resp)
+                    continue
+            else:
                 price_str = str((price_resp.get("data") or {}).get("price") or "")
                 price_val = float(price_str or 0)
         except Exception as exc:  # noqa: BLE001
             LOG.debug("price sku=%s failed: %s", sid, exc)
+            if sku.get("injected"):
+                continue
+        pref = len(PREFERRED_CPU_LABEL_ORDER)
+        for i, name in enumerate(PREFERRED_CPU_LABEL_ORDER):
+            if label == name or label.startswith(name.replace("_cpu", "")):
+                pref = i
+                break
         row = {
             **sku,
             "skuId": sid,
@@ -524,30 +644,33 @@ def list_skus_ranked(
             "mem": mem,
             "price": price_str,
             "price_val": price_val,
-            "label": sku.get("label") or f"sku-{sid}",
+            "label": label or f"sku-{sid}",
+            "pref": pref,
         }
         ranked.append(row)
         LOG.info(
-            "sku candidate id=%s label=%s cpu=%s mem=%s price=%s",
+            "sku candidate id=%s label=%s cpu=%s mem=%s price=%s pref=%s injected=%s",
             sid,
             row["label"],
             cpu,
             mem,
             price_str or "-",
+            pref,
+            bool(sku.get("injected")),
         )
-    # high → low: cpu, mem, price, then preferred first among equals
-    # high → low: cpu, mem, hourly price
+
+    # 1) preferred label order (c64_m64, c52_m96, ...) 2) cpu/mem/price high→low
     ranked.sort(
         key=lambda x: (
-            int(x.get("cpu") or 0),
-            float(x.get("mem") or 0),
-            float(x.get("price_val") or 0),
+            int(x.get("pref") if x.get("pref") is not None else 999),
+            -int(x.get("cpu") or 0),
+            -float(x.get("mem") or 0),
+            -float(x.get("price_val") or 0),
             int(x["skuId"]),
-        ),
-        reverse=True,
+        )
     )
     LOG.info(
-        "sku order (high→low): %s",
+        "sku order (preferred then high→low): %s",
         ", ".join(f"{x['skuId']}({x.get('label')})" for x in ranked[:20]),
     )
     return ranked
