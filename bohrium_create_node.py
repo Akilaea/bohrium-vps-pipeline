@@ -416,7 +416,7 @@ def wait_account_ready(
     last_err = "account not ready"
     attempt = 0
     LOG.info(
-        "wait account ready: project+balance (timeout=%ss, new accounts often need 5-30s)",
+        "等待新号项目/余额就绪（超时%ss；新号常见需5-30s，属正常轮询）",
         int(timeout),
     )
     while time.time() < deadline:
@@ -426,9 +426,9 @@ def wait_account_ready(
         try:
             bal = client.balance()
             value = _balance_value(bal)
-            if attempt == 1 or attempt % 3 == 0:
+            if attempt == 1 or attempt % 2 == 0:
                 LOG.info(
-                    "account wait #%s elapsed=%ss left=%ss balance=%s",
+                    "账号等待 #%s 已等=%ss 剩余=%ss 余额=%s",
                     attempt,
                     elapsed,
                     left,
@@ -437,7 +437,7 @@ def wait_account_ready(
             if value < min_balance:
                 last_err = f"balance too low: {value}"
                 LOG.info(
-                    "account wait: balance=%s < %s, retry in %ss",
+                    "账号等待：余额=%s<%s，%ss后重试",
                     value,
                     min_balance,
                     interval,
@@ -446,7 +446,7 @@ def wait_account_ready(
                 continue
             project = pick_default_project(client, project_id=project_id)
             LOG.info(
-                "account ready after %ss project=%s balance=%s",
+                "账号就绪 用时%ss 项目=%s 余额=%s",
                 elapsed,
                 project.get("id") or project.get("projectId"),
                 value,
@@ -456,7 +456,7 @@ def wait_account_ready(
             last_err = str(exc)
             # Common: new account project not provisioned yet
             LOG.info(
-                "account wait #%s elapsed=%ss left=%ss: %s (normal for new signup)",
+                "账号等待 #%s 已等=%ss 剩余=%ss：%s（新号项目未就绪，正常）",
                 attempt,
                 elapsed,
                 left,
@@ -978,7 +978,7 @@ def wait_node(
     last: dict[str, Any] | None = None
     last_sig = ""
     t0 = time.time()
-    next_heartbeat = t0 + 60.0
+    next_heartbeat = t0 + 15.0
     while time.time() < deadline:
         data = client.node_list(queryType="private", orderBy="startTimeDesc")
         items = ((data.get("data") or {}).get("items") or [])
@@ -1012,28 +1012,27 @@ def wait_node(
             if sig != last_sig:
                 last_sig = sig
                 LOG.info(
-                    "node prepare id=%s phase=%s elapsed=%ss ip=%s pwd=%s msg=%s est=%s",
+                    "节点准备中 id=%s 状态=%s 已等=%ss IP=%s 密码=%s msg=%s",
                     node_id,
                     st_label,
                     elapsed,
                     creds.get("ip") or "-",
-                    "yes" if creds.get("password") else "no",
+                    "有" if creds.get("password") else "无",
                     msg or "-",
-                    creds.get("estimate_start_time") or "-",
                 )
             elif time.time() >= next_heartbeat:
                 # periodic heartbeat while still queuing for resources
                 left = max(0, int(deadline - time.time()))
                 LOG.info(
-                    "node monitor id=%s phase=%s elapsed=%ss left=%ss ip=%s pwd=%s (waiting resource)",
+                    "节点排队中 id=%s 状态=%s 已等=%ss 剩余超时=%ss IP=%s 密码=%s（资源下发中，非卡死）",
                     node_id,
                     st_label,
                     elapsed,
                     left,
                     creds.get("ip") or "-",
-                    "yes" if creds.get("password") else "no",
+                    "有" if creds.get("password") else "无",
                 )
-                next_heartbeat = time.time() + 60.0
+                next_heartbeat = time.time() + 30.0
             if node_is_terminal_fail(last):
                 LOG.warning(
                     "node %s terminal phase=%s — stop waiting",
@@ -1217,12 +1216,12 @@ def create_node(
         LOG.info("balance: %s", bal.get("data"))
 
         # New accounts often need a few seconds before project/credits appear.
-        LOG.info("waiting project/balance for new account (not stuck; polling)...")
+        LOG.info("正在轮询新号项目/余额（非卡死）...")
         project = wait_account_ready(
             client, project_id=project_id, min_balance=1.0, timeout=120.0, interval=3.0
         )
         pid = int(project.get("id") or project.get("projectId"))
-        LOG.info("project ready id=%s name=%s", pid, project.get("name"))
+        LOG.info("项目就绪 id=%s name=%s", pid, project.get("name"))
 
         # Build SKU try-list: high-spec → low-spec (or single fixed SKU).
         bal_value = _balance_value(bal)
@@ -1502,7 +1501,7 @@ def create_node(
                 if sku_fallback and remain > 0:
                     to = min(to, 300.0)
                 LOG.info(
-                    "node monitor start id=%s sku=%s timeout=%ss (resource may take up to 1h)",
+                    "开始等节点凭证 id=%s sku=%s 超时=%ss（资源排队最长约1小时，每30s会有进度）",
                     node_id,
                     sid,
                     int(to),

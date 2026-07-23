@@ -134,17 +134,21 @@ def setup_logging(verbose: bool = False) -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
     root.addHandler(handler)
 
-    # 默认静音子模块英文日志，只保留本脚本中文摘要
+    # 进度相关模块保留 INFO（账号等待/节点 IP 轮询要进 UI）
+    for name in ("bohrium_register", "bohrium_create_node", "bohrium_ssh", "bohrium_notebook"):
+        logging.getLogger(name).setLevel(logging.DEBUG if verbose else logging.INFO)
+        logging.getLogger(name).propagate = True
+    # 仅静音噪声库
     quiet_level = logging.WARNING if not verbose else logging.DEBUG
     for name in (
-        "bohrium_register",
-        "bohrium_create_node",
-        "bohrium_ssh",
         "paramiko",
         "paramiko.transport",
         "urllib3",
+        "urllib3.connectionpool",
         "requests",
         "websocket",
+        "curl_cffi",
+        "captcha_multi",
     ):
         logging.getLogger(name).setLevel(quiet_level)
         logging.getLogger(name).propagate = True
