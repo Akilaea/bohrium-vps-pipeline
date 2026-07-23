@@ -31,6 +31,11 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:  # pragma: no cover
+    curl_requests = None
+
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
@@ -63,11 +68,15 @@ CAPTCHA_ENTRY_URL = LOGIN_PAGE
 CAPTCHA_ENTRY_REFERER = PLATFORM + "/"
 
 DEFAULT_PROXY = "http://127.0.0.1:7890"
+# Match a real desktop Chrome (also used by curl_cffi impersonate)
+DEFAULT_CHROME_MAJOR = 131
 DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/138.0.0.0 Safari/537.36"
+    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    f"AppleWebKit/537.36 (KHTML, like Gecko) "
+    f"Chrome/{DEFAULT_CHROME_MAJOR}.0.0.0 Safari/537.36"
 )
+# Prefer browser-like TLS; fall back to requests if curl_cffi missing
+USE_BROWSER_TLS = True
 
 # sceneType int (validated by backend). 1 works for email login/register send.
 DEFAULT_SCENE_TYPE = 1
@@ -172,10 +181,29 @@ class BohriumClient:
         user_agent: str = DEFAULT_UA,
         timeout: float = 30.0,
         language: str = "en-US",
+        *,
+        browser_tls: bool = USE_BROWSER_TLS,
+        chrome_major: int = DEFAULT_CHROME_MAJOR,
     ) -> None:
         self.proxy = proxy
         self.timeout = timeout
-        self.session = requests.Session()
+        self.user_agent = user_agent
+        self.chrome_major = int(chrome_major)
+        self.browser_tls = bool(browser_tls and curl_requests is not None)
+        if self.browser_tls:
+            # Impersonate real Chrome TLS/HTTP2 (main reason browser works, requests 405)
+            imp = f"chrome{self.chrome_major}"
+            try:
+                self.session = curl_requests.Session(impersonate=imp)
+                LOG.info("HTTP session: curl_cffi impersonate=%s", imp)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("curl_cffi impersonate failed (%s), fallback requests", exc)
+                self.session = requests.Session()
+                self.browser_tls = False
+        else:
+            self.session = requests.Session()
+            if browser_tls and curl_requests is None:
+                LOG.warning("curl_cffi not installed; using plain requests (easier WAF 405)")
         if proxy:
             self.session.proxies.update({"http": proxy, "https": proxy})
         self.session.headers.update(
@@ -187,21 +215,96 @@ class BohriumClient:
                 "Origin": PLATFORM,
                 "Referer": LOGIN_PAGE,
                 "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+                "sec-ch-ua": (
+                    f'"Google Chrome";v="{self.chrome_major}", '
+                    f'"Chromium";v="{self.chrome_major}", "Not_A Brand";v="24"'
+                ),
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
             }
         )
 
     def warm(self) -> None:
-        resp = self.session.get(LOGIN_PAGE, timeout=self.timeout)
+        # Mimic browser: open login HTML first (document navigation headers)
+        nav_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        resp = self.session.get(LOGIN_PAGE, timeout=self.timeout, headers=nav_headers)
         resp.raise_for_status()
         LOG.debug("login page status=%s cookies=%s", resp.status_code, dict(self.session.cookies))
+        # Hit a few static assets lightly to look less like pure API bot (best-effort)
+        for url in (
+            "https://cdn.bohrium.com/platform/web/static/js/main.0fbcf98a.js",
+            f"{API}/captcha/config",
+        ):
+            try:
+                self.session.get(
+                    url,
+                    timeout=min(self.timeout, 15),
+                    headers={
+                        "Accept": "*/*" if url.endswith(".js") else "application/json, text/plain, */*",
+                        "Referer": LOGIN_PAGE,
+                        "Sec-Fetch-Dest": "script" if url.endswith(".js") else "empty",
+                        "Sec-Fetch-Mode": "no-cors" if url.endswith(".js") else "cors",
+                        "Sec-Fetch-Site": "cross-site" if "cdn.bohrium" in url else "same-origin",
+                    },
+                )
+            except Exception:
+                pass
 
     def captcha_config(self) -> dict[str, Any]:
-        resp = self.session.get(f"{API}/captcha/config", timeout=self.timeout)
+        resp = self.session.get(
+            f"{API}/captcha/config",
+            timeout=self.timeout,
+            headers={"Referer": LOGIN_PAGE, "Origin": PLATFORM},
+        )
         resp.raise_for_status()
         return resp.json()
 
+    def captcha_encrypt_appid(self, captcha_app_id: int | str = TENCENT_CAPTCHA_AID) -> str | None:
+        """Browser flow: POST /api/captcha/encrypt_appid {captchaAppId} → signAppIdStr.
+
+        Real Chromium calls this before Tencent prehandle and passes aidEncrypted=.
+        """
+        headers = {"Referer": LOGIN_PAGE, "Origin": PLATFORM}
+        try:
+            resp = self.session.post(
+                f"{API}/captcha/encrypt_appid",
+                json={"captchaAppId": int(captcha_app_id)},
+                timeout=self.timeout,
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                LOG.debug("encrypt_appid HTTP %s", resp.status_code)
+                return None
+            data = resp.json() or {}
+            if int(data.get("code", -1)) != 0:
+                LOG.debug("encrypt_appid business: %s", data)
+                return None
+            sig = ((data.get("data") or {}) if isinstance(data.get("data"), dict) else {}).get(
+                "signAppIdStr"
+            )
+            if sig:
+                LOG.info("captcha encrypt_appid ok len=%s", len(str(sig)))
+                return str(sig)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("encrypt_appid failed: %s", exc)
+        return None
+
     def is_oversea(self) -> bool:
-        resp = self.session.get(f"{API}/account/is_oversea", timeout=self.timeout)
+        resp = self.session.get(
+            f"{API}/account/is_oversea",
+            timeout=self.timeout,
+            headers={"Referer": LOGIN_PAGE, "Origin": PLATFORM},
+        )
         resp.raise_for_status()
         data = resp.json() or {}
         return bool(data.get("data"))
@@ -280,34 +383,33 @@ class BohriumClient:
         captcha: CaptchaTicket | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        # platform login/email_code：主字段 PascalCase（实测有效）
+        # Frontend (main.*.js) uses camelCase for email_code login
         payload: dict[str, Any] = {
-            "Email": email,
-            "Code": str(code),
-            "BusinessLine": BUSINESS_LINE,
+            "email": email,
+            "code": str(code),
+            "businessLine": BUSINESS_LINE,
+            "refer": refer if refer is not None else {},
             "channel": channel,
             "device": device,
+            "ext": ext or "",
         }
-        if refer is not None:
-            payload["refer"] = refer
-        if ext:
-            payload["ext"] = ext
         if captcha is not None:
             payload["ticket"] = captcha.ticket
             payload["randstr"] = captcha.randstr
-            payload["Ticket"] = captcha.ticket
-            payload["Randstr"] = captcha.randstr
         if extra:
             payload.update(extra)
         LOG.info(
-            "login/register email_code -> %s captcha=%s",
+            "login/register email_code -> %s captcha=%s browser_tls=%s",
             email,
             "yes" if captcha else "no",
+            self.browser_tls,
         )
-        # 强制 platform Origin
         headers = {
             "Origin": PLATFORM,
             "Referer": LOGIN_PAGE,
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
         last_err: Exception | None = None
         data: dict[str, Any] = {}
@@ -319,31 +421,32 @@ class BohriumClient:
                 timeout=self.timeout,
             )
             if resp.status_code == 405:
-                # HTML 405 = 网关/WAF，通常不是业务「验证码错误」(那是 JSON code)
                 snippet = (resp.text or "")[:120].replace("\n", " ")
                 LOG.warning(
-                    "login email_code HTTP 405 (attempt %s/3) body~%s",
+                    "login email_code HTTP 405 (attempt %s/3) tls=%s body~%s",
                     attempt,
+                    "curl_cffi" if self.browser_tls else "requests",
                     snippet,
                 )
-                time.sleep(2.0 * attempt)
+                time.sleep(2.0 * attempt + random.uniform(0.3, 1.2))
                 last_err = RuntimeError(
-                    "login email_code HTTP 405 (WAF/gateway; often not captcha JSON reject)"
+                    "login email_code HTTP 405 (WAF/gateway; browser TLS may help)"
                 )
+                # retry PascalCase once (older gateways)
                 if attempt == 2:
-                    camel = {
-                        "email": email,
-                        "code": str(code),
-                        "businessLine": BUSINESS_LINE,
+                    pascal = {
+                        "Email": email,
+                        "Code": str(code),
+                        "BusinessLine": BUSINESS_LINE,
                         "channel": channel,
                         "device": device,
                     }
                     if captcha is not None:
-                        camel["ticket"] = captcha.ticket
-                        camel["randstr"] = captcha.randstr
+                        pascal["ticket"] = captcha.ticket
+                        pascal["randstr"] = captcha.randstr
                     resp = self.session.post(
                         LOGIN_EMAIL_URL,
-                        json=camel,
+                        json=pascal,
                         headers=headers,
                         timeout=self.timeout,
                     )
@@ -472,9 +575,15 @@ def register_once(
 
         email, mail_token = mail.create(prefix=prefix)
 
-        # Always try captcha when backend enables it, or when forced.
-        # Note: HTTP 405 on login is usually Aliyun WAF HTML, NOT captcha JSON reject;
-        # still attach ticket to lower risk score when possible.
+        # Browser always runs Tencent captcha when isUseNewCaptchaVerify=true
+        # (observed: encrypt_appid → prehandle subcapclass=2408 点图).
+        # HTTP 405 on login is still often WAF HTML; ticket still helps when solvable.
+        aid_encrypted = None
+        try:
+            aid_encrypted = client.captcha_encrypt_appid(TENCENT_CAPTCHA_AID)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("encrypt_appid skip: %s", exc)
+
         if require_captcha or use_captcha:
             try:
                 captcha = solve_slide_captcha(
@@ -488,6 +597,8 @@ def register_once(
                     raise
                 LOG.warning("captcha solve failed, continue without ticket: %s", exc)
                 captcha = None
+        if aid_encrypted:
+            LOG.info("have aidEncrypted for Tencent (browser parity)")
 
         send_resp = client.send_email_code(
             email,

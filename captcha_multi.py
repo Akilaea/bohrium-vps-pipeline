@@ -138,10 +138,12 @@ def _solve_text(proxy: str | None, *, aid: int, retries: int, seed: int | None) 
     return _ticket_from_result(result, "text")
 
 
-# Order: slide first (most common for login), then image, then text.
+# Bohrium live browser (Playwright) showed Tencent prehandle:
+#   subcapclass=2408  → image click (点图), not pure slide.
+# Order: image first for Bohrium, then slide, then text.
 SOLVERS: list[tuple[str, Callable[..., CaptchaTicket]]] = [
-    ("slide", _solve_slide),
     ("image", _solve_image),
+    ("slide", _solve_slide),
     ("text", _solve_text),
 ]
 
