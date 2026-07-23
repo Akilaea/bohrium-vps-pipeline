@@ -48,8 +48,7 @@ from bohrium_ssh import connect_ssh, run_cmd, wait_ssh_port  # noqa: E402
 LOG = logging.getLogger("vps")
 PRINT_LOCK = threading.Lock()
 
-IN_CI = bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI"))
-DEFAULT_PROXY = None if IN_CI else "http://127.0.0.1:7890"
+DEFAULT_PROXY = "http://127.0.0.1:7890"
 DEFAULT_WALLET = (
     os.environ.get("VPS_WALLET", "").strip()
     or "TWdsFCGsotzaLMZnyhVyDJ1sHz8hvxqyat"
@@ -573,11 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Bohrium：注册 -> 创建节点 -> SSH 下载执行（支持多任务/重试）"
     )
-    p.add_argument(
-        "--proxy",
-        default=DEFAULT_PROXY or "",
-        help=f"HTTP 代理（默认 {DEFAULT_PROXY or '无 / CI 自动禁用'}）",
-    )
+    p.add_argument("--proxy", default=DEFAULT_PROXY, help=f"HTTP 代理（默认 {DEFAULT_PROXY}）")
     p.add_argument("--no-proxy", action="store_true", help="不使用代理")
     p.add_argument("--token", default=None, help="复用已有 token，跳过注册")
     p.add_argument("--skip-register", action="store_true", help="复用 last_result.json 中的 token")
@@ -634,12 +629,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(verbose=args.v)
 
-    if args.no_proxy:
-        proxy = None
-    else:
-        proxy = (args.proxy or "").strip() or None
-        if IN_CI and proxy and "127.0.0.1" in proxy:
-            proxy = None
+    proxy = None if args.no_proxy else ((args.proxy or "").strip() or None)
     count = max(int(args.count), 1)
     workers = args.workers if args.workers is not None else min(count, DEFAULT_WORKERS)
     workers = max(int(workers), 1)
