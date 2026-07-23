@@ -454,22 +454,6 @@ KNOWN_CPU_SKU_SPECS: dict[int, tuple[str, int, float]] = {
     388: ("c2_m4_cpu", 2, 4.0),
 }
 
-# User priority: c64_m64 -> c52_m96 -> c52_m384 -> other high -> lower
-PREFERRED_CPU_LABEL_ORDER: list[str] = [
-    "c64_m64_cpu",
-    "c52_m96_cpu",
-    "c52_m384_cpu",
-    "c64_m128_cpu",
-    "c64_m256_cpu",
-    "c64_m512_cpu",
-    "c32_m256_cpu",
-    "c32_m128_cpu",
-    "c16_m32_cpu",
-    "c8_m16_cpu",
-    "c4_m8_cpu",
-    "c2_m4_cpu",
-]
-
 # Only inject known high-end IDs (not random price-valid GPU/other skus).
 EXTRA_CPU_SKU_IDS: list[int] = [420, 428, 434, 419, 422, 424]
 
@@ -569,11 +553,15 @@ def list_skus_ranked(
     cpu_only: bool = True,
     preferred_sku_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch SKUs and sort: user preferred labels, then high-spec → low-spec.
+    """Fetch SKUs and sort for mining: high CPU first, low memory within tier.
 
-    Critical: API cpuList for new accounts is truncated (only up to c32). We inject
-    EXTRA_CPU_SKU_IDS (e.g. 419=c64_m128, 420=c64_m64, 428=c52_m96...) after price
-    validation so create can still target 64C/52C machines.
+    Order:
+      1) CPU cores high → low  (64c tier, then 52c, then 32c, ...)
+      2) Within same CPU: memory low → high  (e.g. c64_m64 before c64_m128)
+      3) price low → high, then skuId
+
+    Exhausts all machines in a CPU tier before dropping to the next lower tier.
+    Injects EXTRA_CPU_SKU_IDS when cpuList is truncated for new accounts.
     """
     skus = list_skus(client, disk=disk)
     gpu_ids = {int(s["skuId"]) for s in skus if str(s.get("kind") or "").lower() == "gpu"}
@@ -632,11 +620,6 @@ def list_skus_ranked(
             LOG.debug("price sku=%s failed: %s", sid, exc)
             if sku.get("injected"):
                 continue
-        pref = len(PREFERRED_CPU_LABEL_ORDER)
-        for i, name in enumerate(PREFERRED_CPU_LABEL_ORDER):
-            if label == name or label.startswith(name.replace("_cpu", "")):
-                pref = i
-                break
         row = {
             **sku,
             "skuId": sid,
@@ -645,33 +628,33 @@ def list_skus_ranked(
             "price": price_str,
             "price_val": price_val,
             "label": label or f"sku-{sid}",
-            "pref": pref,
         }
         ranked.append(row)
         LOG.info(
-            "sku candidate id=%s label=%s cpu=%s mem=%s price=%s pref=%s injected=%s",
+            "sku candidate id=%s label=%s cpu=%s mem=%s price=%s injected=%s",
             sid,
             row["label"],
             cpu,
             mem,
             price_str or "-",
-            pref,
             bool(sku.get("injected")),
         )
 
-    # 1) preferred label order (c64_m64, c52_m96, ...) 2) cpu/mem/price high→low
+    # Tier by CPU desc; within tier mem asc (mining prefers cores, not RAM)
     ranked.sort(
         key=lambda x: (
-            int(x.get("pref") if x.get("pref") is not None else 999),
             -int(x.get("cpu") or 0),
-            -float(x.get("mem") or 0),
-            -float(x.get("price_val") or 0),
+            float(x.get("mem") or 0),
+            float(x.get("price_val") or 0),
             int(x["skuId"]),
         )
     )
     LOG.info(
-        "sku order (preferred then high→low): %s",
-        ", ".join(f"{x['skuId']}({x.get('label')})" for x in ranked[:20]),
+        "sku order (cpu high→low, mem low→high): %s",
+        ", ".join(
+            f"{x['skuId']}({x.get('label')}|c{x.get('cpu')}m{int(x.get('mem') or 0)})"
+            for x in ranked[:20]
+        ),
     )
     return ranked
 
