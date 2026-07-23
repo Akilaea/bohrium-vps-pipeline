@@ -1,0 +1,74 @@
+name: VPS Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: Task count
+        required: false
+        default: "1"
+        type: string
+      workers:
+        description: Concurrent workers
+        required: false
+        default: "1"
+        type: string
+      retries:
+        description: Retries per task
+        required: false
+        default: "2"
+        type: string
+      wallet:
+        description: Miner wallet (empty = script default)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          PYTHONUNBUFFERED: "1"
+          VPS_WALLET: ${{ inputs.wallet }}
+        run: |
+          set -euo pipefail
+          COUNT="${{ inputs.count }}"
+          WORKERS="${{ inputs.workers }}"
+          RETRIES="${{ inputs.retries }}"
+          ARGS=(--no-proxy --count "$COUNT" --workers "$WORKERS" --retries "$RETRIES" --out vps_result.json)
+          if [ -n "${{ inputs.wallet }}" ]; then
+            ARGS+=(--wallet "${{ inputs.wallet }}")
+          fi
+          echo "Running: python vps.py ${ARGS[*]}"
+          python vps.py "${ARGS[@]}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-result
+          path: |
+            vps_result.json
+            vps_runs/**
+          if-no-files-found: warn
+          retention-days: 7

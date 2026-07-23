@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+*.log
+
+# runtime / secrets
+last_result.json
+create_node_result.json
+create_node_list.json
+vps_result.json
+ssh_run_result.json
+vps_runs/
+*.json.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
