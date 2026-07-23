@@ -841,6 +841,30 @@ def build_add_payload(
     return payload
 
 
+# Node status enum from web frontend (shared-hooks):
+#   Creating=0, Waiting=1, Running=2, Stopping=3, Stopped=4,
+#   Deleted=5, Failed=6, Hibernating=7
+NODE_STATUS_CREATING = 0
+NODE_STATUS_WAITING = 1
+NODE_STATUS_RUNNING = 2
+NODE_STATUS_STOPPING = 3
+NODE_STATUS_STOPPED = 4
+NODE_STATUS_DELETED = 5
+NODE_STATUS_FAILED = 6
+NODE_STATUS_HIBERNATING = 7
+
+NODE_STATUS_LABELS: dict[int, str] = {
+    0: "Creating/Preparing",
+    1: "Waiting",
+    2: "Running",
+    3: "Stopping",
+    4: "Stopped",
+    5: "Deleted",
+    6: "Failed",
+    7: "Hibernating",
+}
+
+
 def extract_credentials(node: dict[str, Any] | None) -> dict[str, Any]:
     node = node or {}
     return {
@@ -848,14 +872,38 @@ def extract_credentials(node: dict[str, Any] | None) -> dict[str, Any]:
         "username": (node.get("nodeUser") or node.get("username") or "").strip() or None,
         "password": (node.get("nodePwd") or node.get("password") or "").strip() or None,
         "status": node.get("status"),
+        "starting_up_msg": (node.get("startingUpMsg") or "").strip() or None,
+        "estimate_start_time": (node.get("estimateStartTime") or "").strip() or None,
+        "start_time": (node.get("startTime") or "").strip() or None,
         "node_id": node.get("nodeId") or node.get("id"),
         "node_name": node.get("nodeName") or node.get("name"),
     }
 
 
 def credentials_ready(node: dict[str, Any] | None) -> bool:
+    """Ready when Running and IP/user/password are present."""
     creds = extract_credentials(node)
+    try:
+        st = int(creds.get("status")) if creds.get("status") is not None else None
+    except (TypeError, ValueError):
+        st = None
+    # Prefer status==Running; still accept credentials if present (compat).
+    if st is not None and st != NODE_STATUS_RUNNING:
+        return False
     return bool(creds["ip"] and creds["username"] and creds["password"])
+
+
+def node_is_terminal_fail(node: dict[str, Any] | None) -> bool:
+    try:
+        st = int((node or {}).get("status"))
+    except (TypeError, ValueError):
+        return False
+    return st in {
+        NODE_STATUS_STOPPING,
+        NODE_STATUS_STOPPED,
+        NODE_STATUS_DELETED,
+        NODE_STATUS_FAILED,
+    }
 
 
 def wait_node(
@@ -866,10 +914,16 @@ def wait_node(
     interval: float = 3.0,
     require_credentials: bool = True,
 ) -> dict[str, Any] | None:
-    """Poll list + detail until node appears and credentials are ready."""
-    deadline = time.time() + timeout
+    """Poll until Preparing/Creating finishes and credentials are ready.
+
+    Does NOT sleep a fixed wall-clock only: loops on node detail status.
+    status 0/1 = still preparing/waiting; status 2 + ip/pwd = done.
+    timeout is a safety ceiling for stuck prepares / empty inventory.
+    """
+    deadline = time.time() + max(timeout, 5.0)
     last: dict[str, Any] | None = None
     last_sig = ""
+    t0 = time.time()
     while time.time() < deadline:
         data = client.node_list(queryType="private", orderBy="startTimeDesc")
         items = ((data.get("data") or {}).get("items") or [])
@@ -889,25 +943,64 @@ def wait_node(
 
         if last is not None:
             creds = extract_credentials(last)
-            sig = f"{creds.get('status')}|{creds.get('ip')}|{bool(creds.get('password'))}"
+            try:
+                st_i = int(creds.get("status")) if creds.get("status") is not None else -1
+            except (TypeError, ValueError):
+                st_i = -1
+            st_label = NODE_STATUS_LABELS.get(st_i, f"status={creds.get('status')}")
+            msg = creds.get("starting_up_msg") or ""
+            sig = (
+                f"{creds.get('status')}|{msg}|{creds.get('ip')}|"
+                f"{bool(creds.get('password'))}|{creds.get('estimate_start_time')}"
+            )
             if sig != last_sig:
                 last_sig = sig
+                elapsed = int(time.time() - t0)
                 LOG.info(
-                    "node poll id=%s status=%s ip=%s user=%s pwd=%s",
+                    "node prepare id=%s phase=%s elapsed=%ss ip=%s pwd=%s msg=%s est=%s",
                     node_id,
-                    creds.get("status"),
+                    st_label,
+                    elapsed,
                     creds.get("ip") or "-",
-                    creds.get("username") or "-",
-                    ("*" * len(creds["password"])) if creds.get("password") else "-",
+                    "yes" if creds.get("password") else "no",
+                    msg or "-",
+                    creds.get("estimate_start_time") or "-",
                 )
-            # Terminal fail statuses (best-effort; keep waiting if unknown)
-            st = str(creds.get("status") or "").lower()
-            if st in {"failed", "error", "deleted", "released", "3", "4", "5"}:
-                LOG.warning("node %s entered terminal status=%s", node_id, creds.get("status"))
+            if node_is_terminal_fail(last):
+                LOG.warning(
+                    "node %s terminal phase=%s — stop waiting",
+                    node_id,
+                    st_label,
+                )
                 return last
-            if not require_credentials or credentials_ready(last):
+            if not require_credentials:
+                return last
+            # Only accept when preparing done (Running) + credentials
+            if credentials_ready(last):
+                LOG.info(
+                    "node prepare done id=%s phase=%s elapsed=%ss ip=%s",
+                    node_id,
+                    st_label,
+                    int(time.time() - t0),
+                    creds.get("ip"),
+                )
                 return last
         time.sleep(interval)
+    if last is not None:
+        creds = extract_credentials(last)
+        try:
+            st_i = int(creds.get("status")) if creds.get("status") is not None else -1
+        except (TypeError, ValueError):
+            st_i = -1
+        LOG.warning(
+            "node prepare timeout id=%s phase=%s elapsed=%ss ip=%s pwd=%s msg=%s",
+            node_id,
+            NODE_STATUS_LABELS.get(st_i, str(creds.get("status"))),
+            int(time.time() - t0),
+            creds.get("ip") or "-",
+            "yes" if creds.get("password") else "no",
+            creds.get("starting_up_msg") or "-",
+        )
     return last
 
 
@@ -1042,7 +1135,7 @@ def create_node(
     dry_run: bool = False,
     wait: bool = True,
     sku_fallback: bool = True,
-    wait_timeout: float = 90.0,
+    wait_timeout: float = 180.0,
 ) -> CreateNodeResult:
     device = normalize_device(device)
     client = BohriumNodeClient(token, proxy=proxy)
@@ -1288,13 +1381,14 @@ def create_node(
             node_id = int(((create_resp.get("data") or {}).get("id")) or 0) or None
             node_info = None
             if wait and node_id:
-                # History: successful nodes often get IP/pwd in ~10-60s.
-                # Intermediate SKUs use a short wait so we can fall through faster;
-                # last SKU keeps full wait_timeout.
+                # Wait on Preparing/Creating progress (status 0/1 → 2 Running + pwd),
+                # not a blind sleep. timeout is only a stuck-prepare ceiling.
+                # Intermediate SKUs use a shorter ceiling so empty inventory falls
+                # through; last SKU uses full wait_timeout.
                 remain = len(sku_try) - idx
                 to = float(wait_timeout)
                 if sku_fallback and remain > 0:
-                    to = min(to, 40.0)
+                    to = min(to, 90.0)
                 node_info = wait_node(
                     client, node_id, timeout=to, interval=3, require_credentials=True
                 )
