@@ -647,26 +647,17 @@ def register_once(
 
     try:
         client.warm()
-        try:
-            cfg = client.captcha_config()
-            LOG.info("captcha config: %s", cfg)
-            use_captcha = bool((cfg.get("data") or {}).get("isUseNewCaptchaVerify"))
-        except Exception as exc:
-            LOG.warning("captcha config fetch failed: %s", exc)
-            use_captcha = False
-
         email, mail_token = mail.create(prefix=prefix)
 
-        # Browser always runs Tencent captcha when isUseNewCaptchaVerify=true
-        # (observed: encrypt_appid → prehandle subcapclass=2408 点图).
-        # HTTP 405 on login is still often WAF HTML; ticket still helps when solvable.
-        aid_encrypted = None
-        try:
-            aid_encrypted = client.captcha_encrypt_appid(TENCENT_CAPTCHA_AID)
-        except Exception as exc:  # noqa: BLE001
-            LOG.debug("encrypt_appid skip: %s", exc)
-
-        if require_captcha or use_captcha:
+        # Default: skip Tencent captcha (protocol send/login often works without ticket).
+        # Only solve when require_captcha=True (CLI --require-captcha / forced mode).
+        # Avoids 20x concurrent node console + slow image/slide pipeline.
+        if require_captcha:
+            aid_encrypted = None
+            try:
+                aid_encrypted = client.captcha_encrypt_appid(TENCENT_CAPTCHA_AID)
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("encrypt_appid skip: %s", exc)
             try:
                 captcha = solve_slide_captcha(
                     proxy,
@@ -676,12 +667,9 @@ def register_once(
                     aid_encrypted=aid_encrypted,
                 )
             except Exception as exc:
-                if require_captcha:
-                    raise
-                LOG.warning("captcha solve failed, continue without ticket: %s", exc)
-                captcha = None
-        if aid_encrypted:
-            LOG.info("have aidEncrypted for Tencent (browser parity)")
+                raise RuntimeError(f"require_captcha but solve failed: {exc}") from exc
+        else:
+            LOG.info("skip captcha (default; pass require_captcha=True to force)")
 
         send_resp = client.send_email_code(
             email,
@@ -799,7 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--require-captcha",
         action="store_true",
-        help="force solve Tencent slide captcha (aid=194611140) before send",
+        help="force Tencent captcha before send (default: skip; usually not needed)",
     )
     p.add_argument("--captcha-retries", type=int, default=3)
     p.add_argument("--captcha-seed", type=int, default=None)

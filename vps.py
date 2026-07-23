@@ -876,7 +876,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-register", action="store_true", help="复用 last_result.json 中的 token")
     p.add_argument("--prefix", default="bohrium", help="临时邮箱前缀")
     p.add_argument("--mail-timeout", type=int, default=90, help="等验证码超时秒数")
-    p.add_argument("--require-captcha", action="store_true", help="强制打码")
+    p.add_argument(
+        "--require-captcha",
+        action="store_true",
+        help="强制腾讯打码（默认关闭；协议注册多数可不打码）",
+    )
 
     p.add_argument(
         "--sku-mode",
