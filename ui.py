@@ -60,6 +60,10 @@ class App(tk.Tk):
         self.var_wallet = tk.StringVar(value=vps.DEFAULT_WALLET)
         self.var_proxy = tk.StringVar(value=vps.DEFAULT_PROXY or "")
         self.var_no_proxy = tk.BooleanVar(value=not bool(vps.DEFAULT_PROXY))
+        self.var_mode = tk.StringVar(value=vps.DEFAULT_MODE)
+        self.var_repo = tk.StringVar(value=vps.DEFAULT_REPO)
+        self.var_remote_count = tk.StringVar(value=str(vps.DEFAULT_REMOTE_COUNT))
+        self.var_remote_workers = tk.StringVar(value=str(vps.DEFAULT_REMOTE_WORKERS))
 
         def lab(r: int, c: int, t: str) -> None:
             ttk.Label(frm, text=t).grid(row=r, column=c, sticky=tk.W, **pad)
@@ -76,12 +80,30 @@ class App(tk.Tk):
             row=1, column=1, columnspan=5, sticky=tk.EW, **pad
         )
 
-        lab(2, 0, "代理")
+        lab(2, 0, "模式")
+        ttk.Combobox(
+            frm,
+            textvariable=self.var_mode,
+            values=["bootstrap", "mine"],
+            width=12,
+            state="readonly",
+        ).grid(row=2, column=1, sticky=tk.W, **pad)
+        lab(2, 2, "远程开号")
+        ttk.Entry(frm, textvariable=self.var_remote_count, width=8).grid(row=2, column=3, **pad)
+        lab(2, 4, "远程线程")
+        ttk.Entry(frm, textvariable=self.var_remote_workers, width=8).grid(row=2, column=5, **pad)
+
+        lab(3, 0, "仓库")
+        ttk.Entry(frm, textvariable=self.var_repo, width=52).grid(
+            row=3, column=1, columnspan=5, sticky=tk.EW, **pad
+        )
+
+        lab(4, 0, "代理")
         ttk.Entry(frm, textvariable=self.var_proxy, width=36).grid(
-            row=2, column=1, columnspan=3, sticky=tk.EW, **pad
+            row=4, column=1, columnspan=3, sticky=tk.EW, **pad
         )
         ttk.Checkbutton(frm, text="不使用代理", variable=self.var_no_proxy).grid(
-            row=2, column=4, columnspan=2, sticky=tk.W, **pad
+            row=4, column=4, columnspan=2, sticky=tk.W, **pad
         )
 
         btn = ttk.Frame(self)
@@ -170,13 +192,17 @@ class App(tk.Tk):
             count = max(int(self.var_count.get()), 1)
             workers = max(int(self.var_workers.get()), 1)
             retries = max(int(self.var_retries.get()), 0)
+            remote_count = max(int(self.var_remote_count.get()), 1)
+            remote_workers = max(int(self.var_remote_workers.get()), 1)
         except ValueError:
-            messagebox.showerror("参数错误", "任务数 / 线程数 / 重试 必须是整数")
+            messagebox.showerror("参数错误", "任务数 / 线程数 / 重试 / 远程参数 必须是整数")
             return
         wallet = self.var_wallet.get().strip()
         if not wallet:
             messagebox.showerror("参数错误", "钱包地址不能为空")
             return
+        mode = (self.var_mode.get() or "bootstrap").strip().lower()
+        repo = self.var_repo.get().strip() or vps.DEFAULT_REPO
         proxy = None if self.var_no_proxy.get() else (self.var_proxy.get().strip() or None)
 
         for item in self.tree.get_children():
@@ -213,6 +239,11 @@ class App(tk.Tk):
                     "platform": vps.DEFAULT_PLATFORM,
                     "turnoff_after": vps.DEFAULT_TURNOFF_AFTER,
                     "wallet": wallet,
+                    "mode": mode,
+                    "repo": repo,
+                    "remote_count": remote_count,
+                    "remote_workers": remote_workers,
+                    "remote_retries": retries,
                     "wait_ssh": 180.0,
                     "ssh_port": 22,
                     "cmd_timeout": 3600.0,

