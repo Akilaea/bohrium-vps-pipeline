@@ -479,14 +479,19 @@ class TdcClient:
             return
         self.close()
         try:
+            popen_kw: dict[str, Any] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.DEVNULL,
+                "text": True,
+                "encoding": "utf-8",
+                "bufsize": 1,
+            }
+            if sys.platform == "win32":
+                popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             process = subprocess.Popen(
                 [self.node_command, str(self.server_path)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
+                **popen_kw,
             )
         except OSError as exc:
             raise TdcError(f"failed to start Node worker: {exc}") from exc

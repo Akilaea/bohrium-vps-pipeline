@@ -9,6 +9,7 @@ import queue
 import random
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -208,13 +209,19 @@ class TdcClient:
             return
         self.close()
         try:
+            # Windows: hide node.exe console (20 concurrent captcha = 20 black windows)
+            popen_kw: dict[str, Any] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.DEVNULL,
+                "text": True,
+                "bufsize": 1,
+            }
+            if sys.platform == "win32":
+                popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             process = subprocess.Popen(
                 [self.node_command, str(self.server_path)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
+                **popen_kw,
             )
         except OSError as exc:
             raise CaptchaRuntimeError(f"failed to start TDC worker: {exc}") from exc
