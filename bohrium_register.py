@@ -36,8 +36,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent
-PROJECT_ROOT = ROOT.parent
-SLIDE_DIR = PROJECT_ROOT / "slide"
+# Prefer local bypass/slide (user-provided captcha solvers), then legacy ../slide
+SLIDE_DIR = ROOT / "bypass" / "slide"
+if not SLIDE_DIR.is_dir():
+    SLIDE_DIR = ROOT.parent / "slide"
 if str(SLIDE_DIR) not in sys.path:
     sys.path.insert(0, str(SLIDE_DIR))
 
@@ -226,15 +228,19 @@ class BohriumClient:
             "isOversea": bool(is_oversea),
         }
         if captcha is not None:
+            # both casings: some gateways only read one form
             payload["ticket"] = captcha.ticket
             payload["randstr"] = captcha.randstr
+            payload["Ticket"] = captcha.ticket
+            payload["Randstr"] = captcha.randstr
         if extra:
             payload.update(extra)
         LOG.info(
-            "send email code -> %s sceneType=%s isOversea=%s via bohrapi",
+            "send email code -> %s sceneType=%s isOversea=%s captcha=%s via bohrapi",
             email,
             scene_type,
             is_oversea,
+            "yes" if captcha else "no",
         )
         # 发码改走 www.bohrium.com/bohrapi（绕开 platform 的 405 WAF）
         headers = {
@@ -287,10 +293,16 @@ class BohriumClient:
         if captcha is not None:
             payload["ticket"] = captcha.ticket
             payload["randstr"] = captcha.randstr
+            payload["Ticket"] = captcha.ticket
+            payload["Randstr"] = captcha.randstr
         if extra:
             payload.update(extra)
-        LOG.info("login/register email_code -> %s", email)
-        # 强制 platform Origin，避免发码阶段的 www 头污染会话判断
+        LOG.info(
+            "login/register email_code -> %s captcha=%s",
+            email,
+            "yes" if captcha else "no",
+        )
+        # 强制 platform Origin
         headers = {
             "Origin": PLATFORM,
             "Referer": LOGIN_PAGE,
@@ -305,10 +317,17 @@ class BohriumClient:
                 timeout=self.timeout,
             )
             if resp.status_code == 405:
-                LOG.warning("login email_code HTTP 405 (attempt %s/3), backoff", attempt)
+                # HTML 405 = 网关/WAF，通常不是业务「验证码错误」(那是 JSON code)
+                snippet = (resp.text or "")[:120].replace("\n", " ")
+                LOG.warning(
+                    "login email_code HTTP 405 (attempt %s/3) body~%s",
+                    attempt,
+                    snippet,
+                )
                 time.sleep(2.0 * attempt)
-                last_err = RuntimeError("login email_code HTTP 405")
-                # 405 时尝试 camelCase 兜底一轮
+                last_err = RuntimeError(
+                    "login email_code HTTP 405 (WAF/gateway; often not captcha JSON reject)"
+                )
                 if attempt == 2:
                     camel = {
                         "email": email,
@@ -317,6 +336,9 @@ class BohriumClient:
                         "channel": channel,
                         "device": device,
                     }
+                    if captcha is not None:
+                        camel["ticket"] = captcha.ticket
+                        camel["randstr"] = captcha.randstr
                     resp = self.session.post(
                         LOGIN_EMAIL_URL,
                         json=camel,
@@ -428,22 +450,22 @@ def register_once(
 
         email, mail_token = mail.create(prefix=prefix)
 
+        # Always try captcha when backend enables it, or when forced.
+        # Note: HTTP 405 on login is usually Aliyun WAF HTML, NOT captcha JSON reject;
+        # still attach ticket to lower risk score when possible.
         if require_captcha or use_captcha:
-            # Observed: email send currently succeeds without ticket even when
-            # isUseNewCaptchaVerify=true. Still solve when forced or when you want
-            # ticket ready for future enforcement / phone-path parity.
-            if require_captcha:
+            try:
                 captcha = solve_slide_captcha(
                     proxy,
                     aid=TENCENT_CAPTCHA_AID,
                     retries=captcha_retries,
                     seed=captcha_seed,
                 )
-            else:
-                LOG.info(
-                    "backend reports isUseNewCaptchaVerify=true but email send path "
-                    "does not currently require ticket; skip captcha unless --require-captcha"
-                )
+            except Exception as exc:
+                if require_captcha:
+                    raise
+                LOG.warning("captcha solve failed, continue without ticket: %s", exc)
+                captcha = None
 
         send_resp = client.send_email_code(
             email,
