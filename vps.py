@@ -436,7 +436,7 @@ def run_pipeline_once(
             dry_run=False,
             wait=True,
             sku_fallback=True,
-            wait_timeout=120.0,
+            wait_timeout=90.0,
         )
         create_data = create_to_dict(created)
         result["create"] = create_data

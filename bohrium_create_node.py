@@ -1042,7 +1042,7 @@ def create_node(
     dry_run: bool = False,
     wait: bool = True,
     sku_fallback: bool = True,
-    wait_timeout: float = 120.0,
+    wait_timeout: float = 90.0,
 ) -> CreateNodeResult:
     device = normalize_device(device)
     client = BohriumNodeClient(token, proxy=proxy)
@@ -1288,13 +1288,15 @@ def create_node(
             node_id = int(((create_resp.get("data") or {}).get("id")) or 0) or None
             node_info = None
             if wait and node_id:
-                # shorter wait when more SKUs remain so we can fall through faster
+                # History: successful nodes often get IP/pwd in ~10-60s.
+                # Intermediate SKUs use a short wait so we can fall through faster;
+                # last SKU keeps full wait_timeout.
                 remain = len(sku_try) - idx
                 to = float(wait_timeout)
                 if sku_fallback and remain > 0:
-                    to = min(to, 75.0)
+                    to = min(to, 40.0)
                 node_info = wait_node(
-                    client, node_id, timeout=to, interval=4, require_credentials=True
+                    client, node_id, timeout=to, interval=3, require_credentials=True
                 )
                 LOG.info("node info: %s", json.dumps(node_info or {}, ensure_ascii=False)[:500])
             # Learn real spec from detail ASAP (even if IP never arrives)
