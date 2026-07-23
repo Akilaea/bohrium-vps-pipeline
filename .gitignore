@@ -14,7 +14,13 @@ create_node_list.json
 vps_result.json
 ssh_run_result.json
 vps_runs/
+ui_config.json
 *.json.bak
+
+# build
+build/
+dist/
+*.spec.bak
 
 # IDE
 .idea/

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""本地控制台：设置总数/线程 → 开始 → 日志 + 成功数/成功率/进度。
+"""本地控制台（可打包独立运行）：总数/线程、有限/无限递增、定时自动跑、进度与日志。
 
-子服只跑 CLI（vps.py），不需要本 UI。
+子服只跑 vps.py CLI，不需要本 UI。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import sys
@@ -18,11 +19,18 @@ from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
+from paths import app_dir
+
+ROOT = app_dir()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+_res = Path(getattr(sys, "_MEIPASS", str(ROOT)))  # type: ignore[attr-defined]
+if str(_res) not in sys.path:
+    sys.path.insert(0, str(_res))
 
 import vps  # noqa: E402
+
+CONFIG_PATH = ROOT / "ui_config.json"
 
 
 class _QueueHandler(logging.Handler):
@@ -40,9 +48,9 @@ class _QueueHandler(logging.Handler):
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Bohrium VPS 本地控制台")
-        self.geometry("900x620")
-        self.minsize(720, 480)
+        self.title("Bohrium VPS 控制台 · Win 独立版")
+        self.geometry("960x680")
+        self.minsize(800, 520)
 
         self.log_q: queue.Queue[str] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -54,51 +62,92 @@ class App(tk.Tk):
         self.fail_n = 0
         self.t0 = 0.0
         self._lock = threading.Lock()
+        self._timer_job: str | None = None
+        self._next_run_at: float | None = None
+        self._run_round = 0
 
         self._build()
+        self._load_config()
         self.after(100, self._drain_logs)
+        self.after(500, self._tick_timer_label)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self) -> None:
-        pad = {"padx": 8, "pady": 5}
-        top = ttk.Frame(self)
-        top.pack(fill=tk.X, **pad)
+        pad = {"padx": 6, "pady": 4}
+        top = ttk.LabelFrame(self, text="任务参数")
+        top.pack(fill=tk.X, padx=8, pady=4)
 
         self.var_count = tk.StringVar(value=str(vps.DEFAULT_COUNT))
         self.var_workers = tk.StringVar(value=str(vps.DEFAULT_WORKERS))
         self.var_wallet = tk.StringVar(value=vps.DEFAULT_WALLET)
         self.var_no_proxy = tk.BooleanVar(value=True)
-        self.var_infinite = tk.BooleanVar(value=bool(vps.DEFAULT_INFINITE))
+        self.var_expand = tk.StringVar(value="有限递增")  # 有限递增 | 无限递增
+        self.var_remote_count = tk.StringVar(value=str(vps.DEFAULT_REMOTE_COUNT))
+        self.var_remote_workers = tk.StringVar(value=str(vps.DEFAULT_REMOTE_WORKERS))
+        self.var_schedule = tk.BooleanVar(value=False)
+        self.var_interval_min = tk.StringVar(value="30")
+        self.var_run_on_start = tk.BooleanVar(value=True)
 
-        ttk.Label(top, text="总数").grid(row=0, column=0, sticky=tk.W, **pad)
-        ttk.Entry(top, textvariable=self.var_count, width=8).grid(row=0, column=1, **pad)
-        ttk.Label(top, text="线程数").grid(row=0, column=2, sticky=tk.W, **pad)
-        ttk.Entry(top, textvariable=self.var_workers, width=8).grid(row=0, column=3, **pad)
+        r = 0
+        ttk.Label(top, text="总数").grid(row=r, column=0, sticky=tk.W, **pad)
+        ttk.Entry(top, textvariable=self.var_count, width=8).grid(row=r, column=1, **pad)
+        ttk.Label(top, text="线程数").grid(row=r, column=2, sticky=tk.W, **pad)
+        ttk.Entry(top, textvariable=self.var_workers, width=8).grid(row=r, column=3, **pad)
         ttk.Checkbutton(top, text="不使用代理", variable=self.var_no_proxy).grid(
-            row=0, column=4, sticky=tk.W, **pad
-        )
-        ttk.Checkbutton(top, text="无限递增", variable=self.var_infinite).grid(
-            row=0, column=5, sticky=tk.W, **pad
+            row=r, column=4, sticky=tk.W, **pad
         )
 
-        ttk.Label(top, text="钱包").grid(row=1, column=0, sticky=tk.W, **pad)
+        r = 1
+        ttk.Label(top, text="递增模式").grid(row=r, column=0, sticky=tk.W, **pad)
+        ttk.Combobox(
+            top,
+            textvariable=self.var_expand,
+            values=["有限递增", "无限递增"],
+            width=12,
+            state="readonly",
+        ).grid(row=r, column=1, sticky=tk.W, **pad)
+        ttk.Label(top, text="远程开号").grid(row=r, column=2, sticky=tk.W, **pad)
+        ttk.Entry(top, textvariable=self.var_remote_count, width=8).grid(row=r, column=3, **pad)
+        ttk.Label(top, text="远程线程").grid(row=r, column=4, sticky=tk.W, **pad)
+        ttk.Entry(top, textvariable=self.var_remote_workers, width=8).grid(row=r, column=5, **pad)
+
+        r = 2
+        ttk.Label(top, text="钱包").grid(row=r, column=0, sticky=tk.W, **pad)
         ttk.Entry(top, textvariable=self.var_wallet).grid(
-            row=1, column=1, columnspan=5, sticky=tk.EW, **pad
+            row=r, column=1, columnspan=5, sticky=tk.EW, **pad
         )
         top.columnconfigure(1, weight=1)
-        top.columnconfigure(5, weight=0)
+
+        sched = ttk.LabelFrame(self, text="定时自动跑")
+        sched.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Checkbutton(sched, text="启用定时", variable=self.var_schedule).grid(
+            row=0, column=0, sticky=tk.W, **pad
+        )
+        ttk.Label(sched, text="间隔(分钟)").grid(row=0, column=1, sticky=tk.W, **pad)
+        ttk.Entry(sched, textvariable=self.var_interval_min, width=8).grid(row=0, column=2, **pad)
+        ttk.Checkbutton(sched, text="启动后立即跑一轮", variable=self.var_run_on_start).grid(
+            row=0, column=3, sticky=tk.W, **pad
+        )
+        self.var_timer_text = tk.StringVar(value="定时：未启用")
+        ttk.Label(sched, textvariable=self.var_timer_text).grid(
+            row=0, column=4, sticky=tk.W, padx=12
+        )
 
         btn = ttk.Frame(self)
         btn.pack(fill=tk.X, padx=8, pady=2)
-        self.btn_start = ttk.Button(btn, text="开始执行", command=self._start)
+        self.btn_start = ttk.Button(btn, text="开始执行", command=self._start_once)
         self.btn_start.pack(side=tk.LEFT, padx=4)
         self.btn_stop = ttk.Button(btn, text="请求停止", command=self._request_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=4)
+        self.btn_timer = ttk.Button(btn, text="启动定时", command=self._toggle_schedule)
+        self.btn_timer.pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn, text="保存配置", command=self._save_config).pack(side=tk.LEFT, padx=4)
 
         stats = ttk.LabelFrame(self, text="进度")
         stats.pack(fill=tk.X, padx=8, pady=4)
-
-        self.var_progress_text = tk.StringVar(value="就绪 · 0/0 · 成功 0 · 失败 0 · 成功率 - · 用时 0s")
+        self.var_progress_text = tk.StringVar(
+            value="就绪 · 0/0 · 成功 0 · 失败 0 · 成功率 - · 用时 0s"
+        )
         ttk.Label(stats, textvariable=self.var_progress_text, font=("", 10)).pack(
             anchor=tk.W, padx=8, pady=(6, 2)
         )
@@ -112,10 +161,65 @@ class App(tk.Tk):
         )
         self.log.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
+        tip = (
+            "有限递增：本机开 N 台后，子机只挖矿不再开号 | "
+            "无限递增：每层子机继续 bootstrap 开号 | "
+            "定时：间隔到点自动再跑一轮（上一轮未结束则跳过）"
+        )
+        ttk.Label(self, text=tip, foreground="#555").pack(anchor=tk.W, padx=10, pady=(0, 6))
+
+    # ----- config -----
+    def _load_config(self) -> None:
+        if not CONFIG_PATH.is_file():
+            return
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        mapping = {
+            "count": self.var_count,
+            "workers": self.var_workers,
+            "wallet": self.var_wallet,
+            "remote_count": self.var_remote_count,
+            "remote_workers": self.var_remote_workers,
+            "interval_min": self.var_interval_min,
+            "expand": self.var_expand,
+        }
+        for k, var in mapping.items():
+            if k in data and data[k] is not None:
+                var.set(str(data[k]))
+        if "no_proxy" in data:
+            self.var_no_proxy.set(bool(data["no_proxy"]))
+        if "schedule" in data:
+            self.var_schedule.set(bool(data["schedule"]))
+        if "run_on_start" in data:
+            self.var_run_on_start.set(bool(data["run_on_start"]))
+        if data.get("schedule"):
+            self.after(800, self._start_schedule)
+
+    def _save_config(self) -> None:
+        data = {
+            "count": self.var_count.get(),
+            "workers": self.var_workers.get(),
+            "wallet": self.var_wallet.get(),
+            "no_proxy": bool(self.var_no_proxy.get()),
+            "expand": self.var_expand.get(),
+            "remote_count": self.var_remote_count.get(),
+            "remote_workers": self.var_remote_workers.get(),
+            "schedule": bool(self.var_schedule.get()),
+            "interval_min": self.var_interval_min.get(),
+            "run_on_start": bool(self.var_run_on_start.get()),
+        }
+        try:
+            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.log_q.put(f"配置已保存：{CONFIG_PATH}")
+        except Exception as exc:
+            messagebox.showerror("保存失败", str(exc))
+
+    # ----- logging / stats -----
     def _append_log(self, line: str) -> None:
         self.log.configure(state=tk.NORMAL)
         self.log.insert(tk.END, line.rstrip() + "\n")
-        # keep last ~3000 lines
         try:
             lines = int(self.log.index("end-1c").split(".")[0])
             if lines > 3200:
@@ -142,16 +246,15 @@ class App(tk.Tk):
             ok_n = self.ok_n
             fail_n = self.fail_n
             t0 = self.t0
+            rnd = self._run_round
         elapsed = max(time.time() - t0, 0.0) if t0 else 0.0
         rate = (ok_n / done * 100.0) if done else 0.0
         pct = (done / total * 100.0) if total else 0.0
         self.progress["value"] = pct
+        state = "运行中" if self.running else "就绪"
         self.var_progress_text.set(
-            f"{'运行中' if self.running else '完成'} · "
-            f"{done}/{total} ({pct:.1f}%) · "
-            f"成功 {ok_n} · 失败 {fail_n} · "
-            f"成功率 {rate:.1f}% · "
-            f"用时 {int(elapsed)}s"
+            f"{state} · 第{rnd}轮 · {done}/{total} ({pct:.1f}%) · "
+            f"成功 {ok_n} · 失败 {fail_n} · 成功率 {rate:.1f}% · 用时 {int(elapsed)}s"
         )
 
     def _bump(self, ok: bool) -> None:
@@ -162,22 +265,123 @@ class App(tk.Tk):
             else:
                 self.fail_n += 1
 
-    def _start(self) -> None:
-        if self.running:
+    # ----- schedule -----
+    def _toggle_schedule(self) -> None:
+        if self._timer_job is not None or self.var_schedule.get():
+            if self._timer_job is not None and not self.var_schedule.get():
+                self._stop_schedule()
+                return
+        if self.var_schedule.get() and self._timer_job is not None:
+            self._stop_schedule()
+            self.var_schedule.set(False)
+            self.btn_timer.configure(text="启动定时")
+            self.log_q.put("定时已停止")
             return
+        self.var_schedule.set(True)
+        self._start_schedule()
+
+    def _start_schedule(self) -> None:
+        try:
+            mins = max(float(self.var_interval_min.get().strip()), 1.0)
+        except ValueError:
+            messagebox.showerror("参数错误", "间隔分钟必须是数字")
+            self.var_schedule.set(False)
+            return
+        self.var_schedule.set(True)
+        self.btn_timer.configure(text="停止定时")
+        self.log_q.put(f"定时已启用：每 {mins:g} 分钟跑一轮")
+        if self.var_run_on_start.get() and not self.running:
+            self._start_once(from_timer=True)
+        self._arm_timer(mins * 60.0)
+
+    def _stop_schedule(self) -> None:
+        if self._timer_job is not None:
+            try:
+                self.after_cancel(self._timer_job)
+            except Exception:
+                pass
+            self._timer_job = None
+        self._next_run_at = None
+        self.btn_timer.configure(text="启动定时")
+        self.var_timer_text.set("定时：未启用")
+
+    def _arm_timer(self, delay_sec: float) -> None:
+        if self._timer_job is not None:
+            try:
+                self.after_cancel(self._timer_job)
+            except Exception:
+                pass
+        self._next_run_at = time.time() + max(delay_sec, 5.0)
+        ms = int(max(delay_sec, 5.0) * 1000)
+        self._timer_job = self.after(ms, self._on_timer_fire)
+
+    def _on_timer_fire(self) -> None:
+        self._timer_job = None
+        if not self.var_schedule.get():
+            self.var_timer_text.set("定时：未启用")
+            return
+        if self.running:
+            self.log_q.put("定时触发：上一轮仍在运行，跳过本轮")
+        else:
+            self._start_once(from_timer=True)
+        try:
+            mins = max(float(self.var_interval_min.get().strip()), 1.0)
+        except ValueError:
+            mins = 30.0
+        self._arm_timer(mins * 60.0)
+
+    def _tick_timer_label(self) -> None:
+        if self.var_schedule.get() and self._next_run_at:
+            left = max(int(self._next_run_at - time.time()), 0)
+            m, s = divmod(left, 60)
+            self.var_timer_text.set(f"定时：已启用 · 下次约 {m}分{s:02d}秒后")
+        elif not self.var_schedule.get():
+            self.var_timer_text.set("定时：未启用")
+        self.after(500, self._tick_timer_label)
+
+    # ----- run -----
+    def _parse_params(self) -> dict[str, Any] | None:
         try:
             count = max(int(self.var_count.get().strip()), 1)
             workers = max(int(self.var_workers.get().strip()), 1)
+            remote_count = max(int(self.var_remote_count.get().strip()), 1)
+            remote_workers = max(int(self.var_remote_workers.get().strip()), 1)
         except ValueError:
-            messagebox.showerror("参数错误", "总数 / 线程数 必须是整数")
-            return
+            messagebox.showerror("参数错误", "总数/线程/远程参数必须是整数")
+            return None
         wallet = self.var_wallet.get().strip()
         if not wallet:
             messagebox.showerror("参数错误", "钱包不能为空")
-            return
-
-        infinite = bool(self.var_infinite.get())
+            return None
+        infinite = self.var_expand.get().strip() == "无限递增"
         proxy = None if self.var_no_proxy.get() else (vps.DEFAULT_PROXY or None)
+        return {
+            "count": count,
+            "workers": workers,
+            "remote_count": remote_count,
+            "remote_workers": remote_workers,
+            "wallet": wallet,
+            "infinite": infinite,
+            "proxy": proxy,
+        }
+
+    def _start_once(self, from_timer: bool = False) -> None:
+        if self.running:
+            if not from_timer:
+                messagebox.showinfo("提示", "任务正在运行中")
+            return
+        params = self._parse_params()
+        if not params:
+            return
+        self._save_config()
+
+        count = params["count"]
+        workers = params["workers"]
+        infinite = params["infinite"]
+        wallet = params["wallet"]
+        proxy = params["proxy"]
+        remote_count = params["remote_count"]
+        remote_workers = params["remote_workers"]
 
         self.running = True
         self.stop_flag = False
@@ -187,15 +391,21 @@ class App(tk.Tk):
             self.ok_n = 0
             self.fail_n = 0
             self.t0 = time.time()
+            self._run_round += 1
+            rnd = self._run_round
         self.progress["value"] = 0
         self.btn_start.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
-        self.log.configure(state=tk.NORMAL)
-        self.log.delete("1.0", tk.END)
-        self.log.configure(state=tk.DISABLED)
+        if not from_timer:
+            self.log.configure(state=tk.NORMAL)
+            # keep history for timer rounds; only clear on manual start
+            self.log.delete("1.0", tk.END)
+            self.log.configure(state=tk.DISABLED)
         self._refresh_stats()
+        mode_txt = "无限递增" if infinite else "有限递增"
         self.log_q.put(
-            f"开始：总数={count} 线程={workers} 无限递增={'开' if infinite else '关'} 钱包={wallet}"
+            f"===== 第{rnd}轮开始 ===== 总数={count} 线程={workers} "
+            f"模式={mode_txt} 远程={remote_count}x{remote_workers} 钱包={wallet}"
         )
 
         def run() -> None:
@@ -227,8 +437,8 @@ class App(tk.Tk):
                     "wallet": wallet,
                     "mode": "bootstrap",
                     "repo": vps.DEFAULT_REPO,
-                    "remote_count": vps.DEFAULT_REMOTE_COUNT,
-                    "remote_workers": vps.DEFAULT_REMOTE_WORKERS,
+                    "remote_count": remote_count,
+                    "remote_workers": remote_workers,
                     "remote_retries": vps.DEFAULT_REMOTE_RETRIES,
                     "infinite": infinite,
                     "wait_ssh": 180.0,
@@ -250,11 +460,13 @@ class App(tk.Tk):
                 total = int(summary.get("count") or count)
                 rate = (ok / total * 100.0) if total else 0.0
                 self.log_q.put(
-                    f"全部结束：成功 {ok}/{total} 失败 {fail} 成功率 {rate:.1f}% 明细 {batch_dir}"
+                    f"===== 第{rnd}轮结束 ===== 成功 {ok}/{total} 失败 {fail} "
+                    f"成功率 {rate:.1f}% 明细 {batch_dir}"
                 )
             except Exception as exc:  # noqa: BLE001
                 self.log_q.put(f"异常：{exc}")
-                self.after(0, lambda: messagebox.showerror("运行失败", str(exc)))
+                if not from_timer:
+                    self.after(0, lambda: messagebox.showerror("运行失败", str(exc)))
             finally:
                 if handler is not None:
                     try:
@@ -296,12 +508,7 @@ class App(tk.Tk):
 
         def _one(i: int) -> dict[str, Any]:
             if self.stop_flag:
-                return {
-                    "ok": False,
-                    "task_id": i,
-                    "error": "stopped",
-                    "stage": "stopped",
-                }
+                return {"ok": False, "task_id": i, "error": "stopped", "stage": "stopped"}
             kwargs = dict(base_kwargs)
             kwargs.update(
                 {
@@ -324,6 +531,7 @@ class App(tk.Tk):
                 f"邮箱={reg.get('email') or '-'} | "
                 f"节点={c.get('node_id') or '-'} | "
                 f"IP={c.get('ip') or '-'} | "
+                f"SKU={c.get('sku_label') or c.get('sku_id') or '-'} | "
                 f"错误={vps.short_error(result.get('error') or '-') if not ok else '-'}"
             )
             return result
@@ -369,6 +577,8 @@ class App(tk.Tk):
             if not messagebox.askokcancel("退出", "任务仍在运行，确定退出？"):
                 return
             self.stop_flag = True
+        self._stop_schedule()
+        self._save_config()
         self.destroy()
 
 

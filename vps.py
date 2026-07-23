@@ -30,9 +30,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
+from paths import app_dir  # noqa: E402
+
+ROOT = app_dir()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+# also allow imports from bundled resource dir when frozen
+_res = Path(getattr(sys, "_MEIPASS", str(ROOT)))  # type: ignore[attr-defined]
+if str(_res) not in sys.path:
+    sys.path.insert(0, str(_res))
 
 from bohrium_register import register_once, result_to_dict as register_to_dict  # noqa: E402
 from bohrium_create_node import (  # noqa: E402

@@ -1,3 +1,5 @@
 requests>=2.31.0
 paramiko>=3.4.0
 urllib3>=2.0.0
+# build only (optional on runtime source install)
+# pyinstaller>=6.0.0
