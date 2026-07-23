@@ -25,8 +25,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +48,12 @@ DEFAULT_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/138.0.0.0 Safari/537.36"
 )
+
+# Global soft throttle when WAF/rate-limit (HTTP 405/429) is observed.
+_API_COOLDOWN_UNTIL = 0.0
+_API_COOLDOWN_LOCK = threading.Lock()
+_RELEASE_SWEEP_LOCK = threading.Lock()
+_LAST_RELEASE_SWEEP = 0.0
 
 # empirically verified 0.4 CNY/h SKU on prod
 TARGET_PRICE = None
@@ -115,18 +123,86 @@ class BohriumNodeClient:
     def _url(self, path: str) -> str:
         return f"{self.host}{path}"
 
+    def _wait_global_cooldown(self) -> None:
+        with _API_COOLDOWN_LOCK:
+            until = _API_COOLDOWN_UNTIL
+        delay = until - time.time()
+        if delay > 0:
+            time.sleep(min(delay, 30.0))
+
+    def _mark_rate_limited(self, seconds: float = 8.0) -> None:
+        global _API_COOLDOWN_UNTIL
+        with _API_COOLDOWN_LOCK:
+            _API_COOLDOWN_UNTIL = max(_API_COOLDOWN_UNTIL, time.time() + seconds)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        retries: int = 4,
+    ) -> dict[str, Any]:
+        """HTTP with backoff on 405/429/5xx (WAF / rate limit under high concurrency)."""
+        last_err: str | None = None
+        for attempt in range(1, retries + 1):
+            self._wait_global_cooldown()
+            try:
+                resp = self.session.request(
+                    method,
+                    self._url(path),
+                    json=json_body,
+                    params=params,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                last_err = str(exc)
+                time.sleep(min(1.5 * attempt, 8.0) + random.uniform(0, 0.5))
+                continue
+
+            status = int(resp.status_code)
+            # WAF / gateway sometimes returns HTML 405 Not Allowed under flood
+            if status in {405, 429, 502, 503, 504}:
+                self._mark_rate_limited(6.0 + attempt * 2.0)
+                last_err = f"HTTP {status}"
+                LOG.warning(
+                    "api %s %s -> %s (attempt %s/%s), backoff",
+                    method,
+                    path,
+                    status,
+                    attempt,
+                    retries,
+                )
+                time.sleep(min(2.0 * attempt, 12.0) + random.uniform(0.2, 1.0))
+                continue
+
+            if method.upper() == "GET" and status >= 400:
+                # business JSON with non-2xx is rare; surface cleanly
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    pass
+                if attempt < retries and status >= 500:
+                    time.sleep(1.5 * attempt)
+                    continue
+                resp.raise_for_status()
+
+            try:
+                return resp.json()
+            except Exception:
+                return {"code": status, "raw": (resp.text or "")[:1000]}
+
+        return {"code": 405, "error": {"msg": last_err or "request failed after retries"}, "raw": last_err or ""}
+
     def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
-        resp = self.session.get(self._url(path), timeout=self.timeout, **kwargs)
-        resp.raise_for_status()
-        return resp.json()
+        params = kwargs.pop("params", None)
+        return self._request("GET", path, params=params)
 
     def post(self, path: str, payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        resp = self.session.post(self._url(path), json=payload, timeout=self.timeout, **kwargs)
-        # backend often returns 200 even for business errors
-        try:
-            return resp.json()
-        except Exception:
-            return {"code": resp.status_code, "raw": resp.text[:1000]}
+        return self._request("POST", path, json_body=payload)
 
     def account_info(self) -> dict[str, Any]:
         return self.get("/bohrapi/v1/account/info")
@@ -185,14 +261,30 @@ class BohriumNodeClient:
         return self.get("/bohrapi/v1/account/user/integral")
 
 
-def release_unready_nodes(client: BohriumNodeClient, *, keep_ready: bool = True) -> int:
+def release_unready_nodes(
+    client: BohriumNodeClient,
+    *,
+    keep_ready: bool = True,
+    min_interval: float = 15.0,
+) -> int:
     """Release nodes that have no IP/password (stuck / quota fillers).
 
-    When keep_ready=True, only release nodes without usable credentials.
+    Rate-limited globally: under 20-way concurrency, avoid list+release storms
+    that trigger HTTP 405 WAF blocks.
     """
+    global _LAST_RELEASE_SWEEP
+    with _RELEASE_SWEEP_LOCK:
+        now = time.time()
+        if now - _LAST_RELEASE_SWEEP < min_interval:
+            return 0
+        _LAST_RELEASE_SWEEP = now
+
     released = 0
     try:
         data = client.node_list(queryType="private", orderBy="startTimeDesc")
+        if int(data.get("code", 0) or 0) in {405, 429}:
+            LOG.warning("skip release sweep: list rate-limited %s", data.get("code"))
+            return 0
         items = ((data.get("data") or {}).get("items") or [])
     except Exception as exc:  # noqa: BLE001
         LOG.warning("list nodes for release failed: %s", exc)
@@ -207,6 +299,7 @@ def release_unready_nodes(client: BohriumNodeClient, *, keep_ready: bool = True)
         try:
             client.node_release(nid)
             released += 1
+            time.sleep(0.35)  # soft pace
         except Exception as exc:  # noqa: BLE001
             LOG.warning("release unready %s failed: %s", nid, exc)
     if released:
@@ -647,9 +740,28 @@ def _is_auth_error(msg: str, code: int) -> bool:
     )
 
 
+def _is_rate_limited(msg: str, code: int) -> bool:
+    if code in {405, 429, 502, 503, 504}:
+        return True
+    m = (msg or "").lower()
+    raw = (msg or "") + " " + m
+    return (
+        "not allowed" in m
+        or "too many" in m
+        or "rate limit" in m
+        or "doctypehtml" in m.replace(" ", "")
+        or "<!doctype" in m
+    )
+
+
 def _sku_fail_is_capacity(msg: str, code: int) -> bool:
     """True only for stock/schedule capacity — safe to try lower SKU."""
-    if _is_quota_limit(msg, code) or _is_balance_error(msg, code) or _is_auth_error(msg, code):
+    if (
+        _is_quota_limit(msg, code)
+        or _is_balance_error(msg, code)
+        or _is_auth_error(msg, code)
+        or _is_rate_limited(msg, code)
+    ):
         return False
     m = (msg or "").lower()
     keys = (
@@ -808,11 +920,14 @@ def create_node(
         last_label = str(sku_try[0].get("label") or last_sid)
         # Drop leftover unready nodes so SKU fallback / new creates don't hit 2-node cap.
         try:
-            n0 = release_unready_nodes(client, keep_ready=True)
+            n0 = release_unready_nodes(client, keep_ready=True, min_interval=15.0)
             if n0:
                 LOG.info("pre-create released unready nodes: %s", n0)
         except Exception as exc:  # noqa: BLE001
             LOG.debug("pre-create cleanup: %s", exc)
+
+        # Desync concurrent tasks slightly (20 threads otherwise stampede APIs).
+        time.sleep(random.uniform(0.0, 2.5))
 
         for idx, sku in enumerate(sku_try, start=1):
             sid = int(sku["skuId"])
@@ -864,9 +979,16 @@ def create_node(
                 if _is_auth_error(msg, code):
                     LOG.error("auth error, stop: %s", msg)
                     break
+                # HTTP 405/429 WAF under concurrency — backoff, do not burn SKUs
+                if _is_rate_limited(msg, code):
+                    LOG.warning("rate-limited/WAF code=%s; backoff then %s", code, "retry" if attempt < 3 else "stop")
+                    time.sleep(3.0 * attempt + random.uniform(0.5, 2.0))
+                    if attempt < 3:
+                        continue
+                    break
                 # Quota: release stuck nodes once, retry add at most once — never spam
                 if _is_quota_limit(msg, code):
-                    n = release_unready_nodes(client, keep_ready=True)
+                    n = release_unready_nodes(client, keep_ready=True, min_interval=20.0)
                     LOG.warning(
                         "node quota hit code=%s (released unready=%s); %s",
                         code,
@@ -899,10 +1021,17 @@ def create_node(
             assert create_resp is not None
             code = int(create_resp.get("code", -1))
             if code != 0:
-                msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
-                errors.append(f"sku={sid} add_fail: {msg}")
+                msg = str(
+                    ((create_resp.get("error") or {}).get("msg") if isinstance(create_resp.get("error"), dict) else None)
+                    or create_resp.get("raw")
+                    or create_resp
+                )
+                errors.append(f"sku={sid} add_fail: {str(msg)[:180]}")
                 if _is_auth_error(msg, code) or _is_balance_error(msg, code):
-                    LOG.warning("non-sku-switchable error, stop fallback: %s", msg[:160])
+                    LOG.warning("non-sku-switchable error, stop fallback: %s", str(msg)[:160])
+                    break
+                if _is_rate_limited(msg, code):
+                    LOG.warning("rate-limited during create; stop sku fallback (avoid 405 cascade)")
                     break
                 if _is_quota_limit(msg, code):
                     LOG.warning("project node quota still hit after cleanup; stop sku fallback")
@@ -910,9 +1039,9 @@ def create_node(
                 if sku_fallback and _sku_fail_is_capacity(msg, code) and idx < len(sku_try):
                     LOG.warning("sku=%s capacity fail, try next lower spec", sid)
                     continue
-                # unknown error: try next SKU once if any remain, else stop
-                if sku_fallback and idx < len(sku_try):
-                    LOG.warning("sku=%s add failed (unknown), try next lower: %s", sid, msg[:120])
+                # unknown error: try next SKU only if not HTML/WAF junk
+                if sku_fallback and idx < len(sku_try) and not _is_rate_limited(msg, code):
+                    LOG.warning("sku=%s add failed (unknown), try next lower: %s", sid, str(msg)[:120])
                     continue
                 break
 
@@ -949,17 +1078,17 @@ def create_node(
                     node_info=node_info,
                 )
 
-            # Node created but credentials never ready → release and try lower SKU
+            # Node created but credentials never ready → release this node, optional next SKU
             errors.append(f"sku={sid} node={node_id} no credentials in time")
             if node_id:
                 try:
                     client.node_release(node_id)
-                    time.sleep(2.0)
+                    time.sleep(1.5)
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("release node %s failed: %s", node_id, exc)
-            # also sweep other stuck nodes so next SKU won't hit 2-node cap
+            # Sweep at most every 15s globally (prevents 20-thread list storms → HTTP 405)
             try:
-                release_unready_nodes(client, keep_ready=True)
+                release_unready_nodes(client, keep_ready=True, min_interval=15.0)
             except Exception:
                 pass
             if not sku_fallback or idx >= len(sku_try):
