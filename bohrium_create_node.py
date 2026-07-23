@@ -238,31 +238,26 @@ class BohriumNodeClient:
         return self.post("/bohrapi/v1/node/add", payload)
 
     def node_release(self, node_id: int) -> dict[str, Any]:
-        """Best-effort release/stop of a stuck node so SKU fallback can continue.
+        """Release/delete a node. Primary API (from web UI):
 
-        Bohrium accepts several payload shapes; creating nodes (status=1, no IP)
-        often need force/releaseType fields, otherwise they keep counting toward
-        the 2-nodes-per-project quota.
+          POST /bohrapi/v1/node/del/{nodeId}  body: {"nodeId": <id>}
+
+        Fallbacks keep older path shapes for compatibility.
         """
         nid = int(node_id)
         last: dict[str, Any] = {}
+        # Official delete path first (user-captured from create/container UI)
         candidates: list[tuple[str, dict[str, Any]]] = [
+            (f"/bohrapi/v1/node/del/{nid}", {"nodeId": nid}),
+            (f"/bohrapi/v1/node/del/{nid}", {"id": nid, "nodeId": nid}),
+            ("/bohrapi/v1/node/del", {"nodeId": nid}),
             ("/bohrapi/v1/node/release", {"nodeId": nid}),
-            ("/bohrapi/v1/node/release", {"id": nid}),
+            ("/bohrapi/v1/node/release", {"id": nid, "nodeId": nid}),
             ("/bohrapi/v1/node/release", {"nodeId": nid, "force": True}),
-            ("/bohrapi/v1/node/release", {"id": nid, "force": True}),
-            ("/bohrapi/v1/node/release", {"nodeId": nid, "releaseType": 1}),
-            ("/bohrapi/v1/node/release", {"nodeIds": [nid]}),
-            ("/bohrapi/v1/node/release", {"ids": [nid]}),
             ("/bohrapi/v1/node/batchRelease", {"nodeIds": [nid]}),
-            ("/bohrapi/v1/node/batchRelease", {"ids": [nid]}),
             ("/bohrapi/v1/node/delete", {"nodeId": nid}),
-            ("/bohrapi/v1/node/delete", {"id": nid}),
             ("/bohrapi/v1/node/stop", {"nodeId": nid}),
-            ("/bohrapi/v1/node/shutdown", {"nodeId": nid}),
-            ("/bohrapi/v1/node/turnoff", {"nodeId": nid, "turnoffAfter": 0}),
             (f"/bohrapi/v1/node/{nid}/release", {"nodeId": nid}),
-            (f"/bohrapi/v1/node/{nid}/stop", {"nodeId": nid}),
             (f"/bohrapi/v1/node/{nid}/delete", {"nodeId": nid}),
         ]
         for path, body in candidates:
