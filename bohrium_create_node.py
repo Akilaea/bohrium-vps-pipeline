@@ -563,6 +563,7 @@ def wait_node(
     """Poll list + detail until node appears and credentials are ready."""
     deadline = time.time() + timeout
     last: dict[str, Any] | None = None
+    last_sig = ""
     while time.time() < deadline:
         data = client.node_list(queryType="private", orderBy="startTimeDesc")
         items = ((data.get("data") or {}).get("items") or [])
@@ -582,14 +583,22 @@ def wait_node(
 
         if last is not None:
             creds = extract_credentials(last)
-            LOG.info(
-                "node poll id=%s status=%s ip=%s user=%s pwd=%s",
-                node_id,
-                creds.get("status"),
-                creds.get("ip") or "-",
-                creds.get("username") or "-",
-                ("*" * len(creds["password"])) if creds.get("password") else "-",
-            )
+            sig = f"{creds.get('status')}|{creds.get('ip')}|{bool(creds.get('password'))}"
+            if sig != last_sig:
+                last_sig = sig
+                LOG.info(
+                    "node poll id=%s status=%s ip=%s user=%s pwd=%s",
+                    node_id,
+                    creds.get("status"),
+                    creds.get("ip") or "-",
+                    creds.get("username") or "-",
+                    ("*" * len(creds["password"])) if creds.get("password") else "-",
+                )
+            # Terminal fail statuses (best-effort; keep waiting if unknown)
+            st = str(creds.get("status") or "").lower()
+            if st in {"failed", "error", "deleted", "released", "3", "4", "5"}:
+                LOG.warning("node %s entered terminal status=%s", node_id, creds.get("status"))
+                return last
             if not require_credentials or credentials_ready(last):
                 return last
         time.sleep(interval)
@@ -601,38 +610,69 @@ def _is_quota_limit(msg: str, code: int) -> bool:
     if code == 140111:
         return True
     m = (msg or "").lower()
+    raw = msg or ""
     return (
         "maximum number of your nodes" in m
-        or "max" in m and "node" in m and "project" in m
-        or "最多" in (msg or "") and "节点" in (msg or "")
+        or ("max" in m and "node" in m and "project" in m)
+        or ("最多" in raw and "节点" in raw)
+        or "release your node" in m
+    )
+
+
+def _is_balance_error(msg: str, code: int) -> bool:
+    """Free-credit / recharge issues — retry wait, do NOT switch SKU."""
+    if code == 148888:
+        return True
+    m = (msg or "").lower()
+    return (
+        "balance" in m
+        or "recharge" in m
+        or "integral" in m
+        or "余额" in (msg or "")
+        or "充值" in (msg or "")
+        or "积分" in (msg or "")
+    )
+
+
+def _is_auth_error(msg: str, code: int) -> bool:
+    if code in {401, 403, 140001, 140003}:
+        return True
+    m = (msg or "").lower()
+    raw = msg or ""
+    return (
+        "unauthorized" in m
+        or ("token" in m and "invalid" in m)
+        or "登录" in raw
+        or "未登录" in raw
     )
 
 
 def _sku_fail_is_capacity(msg: str, code: int) -> bool:
-    if _is_quota_limit(msg, code):
-        return True
+    """True only for stock/schedule capacity — safe to try lower SKU."""
+    if _is_quota_limit(msg, code) or _is_balance_error(msg, code) or _is_auth_error(msg, code):
+        return False
     m = (msg or "").lower()
     keys = (
-        "insufficient",
-        "stock",
-        "capacity",
-        "resource",
         "sold out",
         "no available",
-        "not enough",
-        "quota",
+        "out of stock",
+        "no stock",
+        "capacity",
+        "schedule",
         "库存",
-        "不足",
         "无可用",
         "售罄",
-        "资源",
+        "资源不足",
+        "算力",
         "排队",
         "繁忙",
+        "not enough resource",
+        "resource not enough",
     )
     if any(k in m for k in keys):
         return True
-    # business codes that often mean capacity / schedule fail (not 140111)
-    return code in {148888, 140404, 500, 400}
+    # avoid bare "resource"/"insufficient" — matches balance errors
+    return code in {140404, 500}
 
 
 def create_node(
@@ -766,6 +806,13 @@ def create_node(
         last_price = ""
         last_sid = int(sku_try[0]["skuId"])
         last_label = str(sku_try[0].get("label") or last_sid)
+        # Drop leftover unready nodes so SKU fallback / new creates don't hit 2-node cap.
+        try:
+            n0 = release_unready_nodes(client, keep_ready=True)
+            if n0:
+                LOG.info("pre-create released unready nodes: %s", n0)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("pre-create cleanup: %s", exc)
 
         for idx, sku in enumerate(sku_try, start=1):
             sid = int(sku["skuId"])
@@ -806,12 +853,17 @@ def create_node(
             create_resp: dict[str, Any] | None = None
             for attempt in range(1, 4):
                 create_resp = client.node_add(payload)
-                LOG.info("create resp sku=%s attempt=%s: %s", sid, attempt, create_resp)
-                last_create = create_resp
+                # single-line summary; full body only on non-zero
                 code = int(create_resp.get("code", -1))
+                last_create = create_resp
                 if code == 0:
+                    LOG.info("create resp sku=%s attempt=%s: ok", sid, attempt)
                     break
                 msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
+                LOG.info("create resp sku=%s attempt=%s: code=%s msg=%s", sid, attempt, code, msg[:200])
+                if _is_auth_error(msg, code):
+                    LOG.error("auth error, stop: %s", msg)
+                    break
                 # Quota: release stuck nodes once, retry add at most once — never spam
                 if _is_quota_limit(msg, code):
                     n = release_unready_nodes(client, keep_ready=True)
@@ -819,15 +871,18 @@ def create_node(
                         "node quota hit code=%s (released unready=%s); %s",
                         code,
                         n,
-                        "retry once" if attempt == 1 else "stop sku",
+                        "retry once" if attempt == 1 else "stop",
                     )
                     if attempt == 1 and n > 0:
                         time.sleep(3.0)
                         continue
                     break
-                # Balance / new-account race only (do NOT match generic "project")
-                if code in {148888, 140404} or "balance" in msg.lower() or "recharge" in msg.lower():
-                    LOG.warning("node/add transient code=%s msg=%s; retry", code, msg)
+                # Balance / free-credit race only
+                if _is_balance_error(msg, code):
+                    if attempt >= 3:
+                        LOG.warning("balance still insufficient after retries; stop sku tries")
+                        break
+                    LOG.warning("balance transient code=%s; wait account ready (%s/3)", code, attempt)
                     time.sleep(2.0 * attempt)
                     try:
                         project = wait_account_ready(
@@ -838,6 +893,7 @@ def create_node(
                     except Exception as exc:  # noqa: BLE001
                         LOG.warning("re-wait account ready failed: %s", exc)
                     continue
+                # Capacity / other → break inner loop, maybe next SKU
                 break
 
             assert create_resp is not None
@@ -845,16 +901,20 @@ def create_node(
             if code != 0:
                 msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
                 errors.append(f"sku={sid} add_fail: {msg}")
-                # Quota: after cleanup still fail → further lower SKUs won't help, stop
+                if _is_auth_error(msg, code) or _is_balance_error(msg, code):
+                    LOG.warning("non-sku-switchable error, stop fallback: %s", msg[:160])
+                    break
                 if _is_quota_limit(msg, code):
                     LOG.warning("project node quota still hit after cleanup; stop sku fallback")
                     break
                 if sku_fallback and _sku_fail_is_capacity(msg, code) and idx < len(sku_try):
-                    LOG.warning("sku=%s unavailable, try next lower spec", sid)
+                    LOG.warning("sku=%s capacity fail, try next lower spec", sid)
                     continue
-                if not sku_fallback or idx >= len(sku_try):
-                    break
-                continue
+                # unknown error: try next SKU once if any remain, else stop
+                if sku_fallback and idx < len(sku_try):
+                    LOG.warning("sku=%s add failed (unknown), try next lower: %s", sid, msg[:120])
+                    continue
+                break
 
             node_id = int(((create_resp.get("data") or {}).get("id")) or 0) or None
             node_info = None
@@ -863,9 +923,9 @@ def create_node(
                 remain = len(sku_try) - idx
                 to = float(wait_timeout)
                 if sku_fallback and remain > 0:
-                    to = min(to, 90.0)
+                    to = min(to, 75.0)
                 node_info = wait_node(
-                    client, node_id, timeout=to, interval=3, require_credentials=True
+                    client, node_id, timeout=to, interval=4, require_credentials=True
                 )
                 LOG.info("node info: %s", json.dumps(node_info or {}, ensure_ascii=False)[:500])
             creds = extract_credentials(node_info)
@@ -894,8 +954,14 @@ def create_node(
             if node_id:
                 try:
                     client.node_release(node_id)
+                    time.sleep(2.0)
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("release node %s failed: %s", node_id, exc)
+            # also sweep other stuck nodes so next SKU won't hit 2-node cap
+            try:
+                release_unready_nodes(client, keep_ready=True)
+            except Exception:
+                pass
             if not sku_fallback or idx >= len(sku_try):
                 break
             LOG.warning("sku=%s not ready, fallback to next lower spec", sid)
