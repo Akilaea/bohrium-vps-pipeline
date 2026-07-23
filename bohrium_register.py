@@ -36,12 +36,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------------------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent
-# Prefer local bypass/slide (user-provided captcha solvers), then legacy ../slide
-SLIDE_DIR = ROOT / "bypass" / "slide"
+# Local captcha solvers under bypass/{slide,image,text}
+BYPASS_DIR = ROOT / "bypass"
+SLIDE_DIR = BYPASS_DIR / "slide"
 if not SLIDE_DIR.is_dir():
     SLIDE_DIR = ROOT.parent / "slide"
-if str(SLIDE_DIR) not in sys.path:
-    sys.path.insert(0, str(SLIDE_DIR))
+for _p in (ROOT, BYPASS_DIR, SLIDE_DIR, BYPASS_DIR / "image", BYPASS_DIR / "text"):
+    if _p.is_dir() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 PLATFORM = "https://platform.bohrium.com"
 WWW = "https://www.bohrium.com"
@@ -387,11 +389,34 @@ def solve_slide_captcha(
     retries: int = 3,
     seed: int | None = None,
 ) -> CaptchaTicket:
+    """Solve Tencent captcha: try slide / image(点图) / text(点字) in order.
+
+    Bohrium only toggles TencentCaptcha on/off; the concrete challenge type is
+    chosen by Tencent risk control (not fixed to slide).
+    """
+    try:
+        from captcha_multi import solve_tencent_captcha
+    except ImportError:
+        solve_tencent_captcha = None  # type: ignore
+
+    if solve_tencent_captcha is not None:
+        LOG.info(
+            "solving tencent captcha (slide|image|text) aid=%s proxy=%s retries=%s",
+            aid,
+            proxy,
+            retries,
+        )
+        t = solve_tencent_captcha(proxy, aid=aid, retries=retries, seed=seed)
+        LOG.info("captcha solved kind=%s ticket_len=%s randstr=%s", t.kind, len(t.ticket), t.randstr)
+        return CaptchaTicket(ticket=t.ticket, randstr=t.randstr, raw=t.raw or {"kind": t.kind})
+
+    # fallback: slide only
     try:
         from slide_solver import SlideSolver, SlideSolverConfig
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
-            f"cannot import slide_solver from {SLIDE_DIR}; ensure project slide deps are installed"
+            f"cannot import captcha solvers from {BYPASS_DIR}; "
+            "need bypass/slide (and optionally image/text)"
         ) from exc
 
     config = SlideSolverConfig(random_seed=seed)
@@ -408,9 +433,6 @@ def solve_slide_captcha(
         raise RuntimeError(f"slide captcha failed: {result}")
     ticket = str(result["ticket"])
     randstr = str(result.get("randstr") or result.get("randStr") or "")
-    if not randstr:
-        # some solver versions return only ticket; keep empty and let backend reject if needed
-        randstr = ""
     LOG.info("captcha solved ticket_len=%s randstr=%s", len(ticket), randstr)
     return CaptchaTicket(ticket=ticket, randstr=randstr, raw=result)
 
