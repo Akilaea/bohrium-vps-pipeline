@@ -54,7 +54,9 @@ class App(tk.Tk):
 
         self.log_q: queue.Queue[str] = queue.Queue()
         self.worker: threading.Thread | None = None
+        self._workers: list[threading.Thread] = []
         self.running = False
+        self._active_rounds = 0
         self.stop_flag = False
         self.total = 0
         self.done = 0
@@ -84,6 +86,8 @@ class App(tk.Tk):
         self.var_no_proxy = tk.BooleanVar(value=True)
         self.var_expand = tk.StringVar(value="有限递增")  # 有限递增 | 无限递增
         self.var_product = tk.StringVar(value="Start Nodes")  # Start Nodes | Run Notebooks
+        self.var_sku_mode = tk.StringVar(value="固定388")  # 固定388 | 递减回退
+        self.var_sku_id = tk.StringVar(value=str(vps.DEFAULT_SKU_ID_FIXED))
         self.var_remote_count = tk.StringVar(value=str(vps.DEFAULT_REMOTE_COUNT))
         self.var_remote_workers = tk.StringVar(value=str(vps.DEFAULT_REMOTE_WORKERS))
         self.var_schedule = tk.BooleanVar(value=False)
@@ -122,14 +126,26 @@ class App(tk.Tk):
         r = 2
         ttk.Label(top, text="远程线程").grid(row=r, column=0, sticky=tk.W, **pad)
         ttk.Entry(top, textvariable=self.var_remote_workers, width=8).grid(row=r, column=1, **pad)
-        ttk.Label(top, text="独立钱包").grid(row=r, column=2, sticky=tk.W, **pad)
-        ttk.Entry(top, textvariable=self.var_wallet).grid(
-            row=r, column=3, columnspan=3, sticky=tk.EW, **pad
-        )
+        ttk.Label(top, text="SKU模式").grid(row=r, column=2, sticky=tk.W, **pad)
+        ttk.Combobox(
+            top,
+            textvariable=self.var_sku_mode,
+            values=["固定388", "递减回退"],
+            width=12,
+            state="readonly",
+        ).grid(row=r, column=3, sticky=tk.W, **pad)
+        ttk.Label(top, text="skuId").grid(row=r, column=4, sticky=tk.W, **pad)
+        ttk.Entry(top, textvariable=self.var_sku_id, width=8).grid(row=r, column=5, **pad)
+
         r = 3
+        ttk.Label(top, text="独立钱包").grid(row=r, column=0, sticky=tk.W, **pad)
+        ttk.Entry(top, textvariable=self.var_wallet).grid(
+            row=r, column=1, columnspan=5, sticky=tk.EW, **pad
+        )
+        r = 4
         ttk.Label(
             top,
-            text=f"默认 Start Nodes 容器；Notebook 为第二模式；钱包留空= {vps.OWNER_WALLET}",
+            text=f"SKU 固定=只开指定机型(默认388)；递减=高→低回退；钱包留空= {vps.OWNER_WALLET}",
             foreground="#666",
         ).grid(row=r, column=1, columnspan=5, sticky=tk.W, padx=6, pady=(0, 4))
         top.columnconfigure(3, weight=1)
@@ -201,6 +217,8 @@ class App(tk.Tk):
             "interval_min": self.var_interval_min,
             "expand": self.var_expand,
             "product": self.var_product,
+            "sku_mode": self.var_sku_mode,
+            "sku_id": self.var_sku_id,
         }
         for k, var in mapping.items():
             if k in data and data[k] is not None:
@@ -210,6 +228,11 @@ class App(tk.Tk):
                         val = "Run Notebooks"
                     else:
                         val = "Start Nodes"
+                if k == "sku_mode":
+                    if val in ("desc", "递减", "递减回退", "fallback", "auto"):
+                        val = "递减回退"
+                    else:
+                        val = "固定388"
                 # legacy device field ignored
                 var.set(val)
         if "no_proxy" in data:
@@ -229,6 +252,8 @@ class App(tk.Tk):
             "no_proxy": bool(self.var_no_proxy.get()),
             "expand": self.var_expand.get(),
             "product": self.var_product.get(),
+            "sku_mode": self.var_sku_mode.get(),
+            "sku_id": self.var_sku_id.get(),
             "remote_count": self.var_remote_count.get(),
             "remote_workers": self.var_remote_workers.get(),
             "schedule": bool(self.var_schedule.get()),
@@ -276,9 +301,14 @@ class App(tk.Tk):
         rate = (ok_n / done * 100.0) if done else 0.0
         pct = (done / total * 100.0) if total else 0.0
         self.progress["value"] = pct
-        state = "运行中" if self.running else "就绪"
+        with self._lock:
+            active = self._active_rounds
+        if active > 0:
+            state = f"运行中(并行{active}轮)"
+        else:
+            state = "就绪"
         self.var_progress_text.set(
-            f"{state} · 第{rnd}轮 · {done}/{total} ({pct:.1f}%) · "
+            f"{state} · 累计第{rnd}轮 · {done}/{total} ({pct:.1f}%) · "
             f"成功 {ok_n} · 失败 {fail_n} · 成功率 {rate:.1f}% · 用时 {int(elapsed)}s"
         )
 
@@ -345,10 +375,12 @@ class App(tk.Tk):
         if not self.var_schedule.get():
             self.var_timer_text.set("定时：未启用")
             return
+        # 上一轮未结束也并行开新一轮（节点长等待不再阻塞定时）
         if self.running:
-            self.log_q.put("定时触发：上一轮仍在运行，跳过本轮")
-        else:
-            self._start_once(from_timer=True)
+            self.log_q.put(
+                f"定时触发：上一轮仍在运行(并行轮次={self._active_rounds})，同时开启新一轮"
+            )
+        self._start_once(from_timer=True)
         try:
             mins = max(float(self.var_interval_min.get().strip()), 1.0)
         except ValueError:
@@ -396,10 +428,7 @@ class App(tk.Tk):
         }
 
     def _start_once(self, from_timer: bool = False) -> None:
-        if self.running:
-            if not from_timer:
-                messagebox.showinfo("提示", "任务正在运行中")
-            return
+        # 允许多轮并行：定时/手动在上一轮未结束时仍可开新一轮
         params = self._parse_params()
         if not params:
             return
@@ -414,31 +443,39 @@ class App(tk.Tk):
         remote_count = params["remote_count"]
         remote_workers = params["remote_workers"]
 
-        self.running = True
-        self.stop_flag = False
         with self._lock:
-            self.total = count
-            self.done = 0
-            self.ok_n = 0
-            self.fail_n = 0
-            self.t0 = time.time()
+            if self._active_rounds <= 0:
+                self.total = count
+                self.done = 0
+                self.ok_n = 0
+                self.fail_n = 0
+                self.t0 = time.time()
+                self.progress["value"] = 0
+            else:
+                # 并行新一轮：进度分母累加，不清空已完成计数
+                self.total += count
+            self._active_rounds += 1
             self._run_round += 1
             rnd = self._run_round
-        self.progress["value"] = 0
-        self.btn_start.configure(state=tk.DISABLED)
+            active = self._active_rounds
+        self.running = True
+        # 并行轮次各自 stop_flag：仅手动「请求停止」影响后续新任务
+        if not from_timer and active == 1:
+            self.stop_flag = False
+        self.btn_start.configure(state=tk.NORMAL)  # 允许再点开并行轮
         self.btn_stop.configure(state=tk.NORMAL)
-        if not from_timer:
+        if not from_timer and active == 1:
             self.log.configure(state=tk.NORMAL)
-            # keep history for timer rounds; only clear on manual start
             self.log.delete("1.0", tk.END)
             self.log.configure(state=tk.DISABLED)
         self._refresh_stats()
         mode_txt = "无限递增" if infinite else "有限递增"
         product_txt = "Run Notebooks" if product == "notebook" else "Start Nodes"
         wallet_src = "自定义" if params.get("wallet_custom") else "默认"
+        sku_mode_txt = self.var_sku_mode.get()
         self.log_q.put(
-            f"===== 第{rnd}轮开始 ===== 总数={count} 线程={workers} "
-            f"模式={mode_txt} 产品={product_txt} "
+            f"===== 第{rnd}轮开始 ===== 并行中={active} 总数={count} 线程={workers} "
+            f"模式={mode_txt} 产品={product_txt} SKU={sku_mode_txt}/{self.var_sku_id.get()} "
             f"远程={remote_count}x{remote_workers} "
             f"钱包({wallet_src})={wallet}"
         )
@@ -454,6 +491,11 @@ class App(tk.Tk):
                 )
                 root.addHandler(handler)
 
+                sku_mode = "desc" if "递减" in (self.var_sku_mode.get() or "") else "fixed"
+                try:
+                    sku_id_val = int((self.var_sku_id.get() or "").strip() or vps.DEFAULT_SKU_ID_FIXED)
+                except ValueError:
+                    sku_id_val = vps.DEFAULT_SKU_ID_FIXED
                 base_kwargs: dict[str, Any] = {
                     "proxy": proxy,
                     "token": None,
@@ -461,7 +503,8 @@ class App(tk.Tk):
                     "register_prefix": "bohrium",
                     "mail_timeout": 90,
                     "require_captcha": False,
-                    "sku_id": None,
+                    "sku_id": sku_id_val if sku_mode == "fixed" else (sku_id_val or None),
+                    "sku_mode": sku_mode,
                     "image_id": vps.DEFAULT_IMAGE_ID,
                     "disk_size": vps.DEFAULT_DISK,
                     "project_id": None,
@@ -481,8 +524,9 @@ class App(tk.Tk):
                     "ssh_port": 22,
                     "cmd_timeout": 3600.0,
                 }
-                batch_dir = ROOT / "vps_runs" / time.strftime("%Y%m%d_%H%M%S")
-                summary_out = ROOT / "vps_result.json"
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                batch_dir = ROOT / "vps_runs" / f"{stamp}_r{rnd:03d}"
+                summary_out = batch_dir / "summary.json"
                 summary = self._run_many(
                     count=count,
                     workers=workers,
@@ -491,6 +535,11 @@ class App(tk.Tk):
                     out_dir=batch_dir,
                     summary_out=summary_out,
                 )
+                # 最新一轮也写到根目录，便于查看
+                try:
+                    vps._save(ROOT / "vps_result.json", summary)
+                except Exception:
+                    pass
                 ok = int(summary.get("success") or 0)
                 fail = int(summary.get("failed") or 0)
                 total = int(summary.get("count") or count)
@@ -500,20 +549,28 @@ class App(tk.Tk):
                     f"成功率 {rate:.1f}% 明细 {batch_dir}"
                 )
             except Exception as exc:  # noqa: BLE001
-                self.log_q.put(f"异常：{exc}")
+                self.log_q.put(f"第{rnd}轮异常：{exc}")
                 if not from_timer:
-                    self.after(0, lambda: messagebox.showerror("运行失败", str(exc)))
+                    self.after(0, lambda e=exc: messagebox.showerror("运行失败", str(e)))
             finally:
                 if handler is not None:
                     try:
                         logging.getLogger().removeHandler(handler)
                     except Exception:
                         pass
-                self.running = False
-                self.after(0, self._finish_ui)
+                with self._lock:
+                    self._active_rounds = max(0, self._active_rounds - 1)
+                    still = self._active_rounds > 0
+                    left = self._active_rounds
+                self.running = still
+                self.log_q.put(f"第{rnd}轮线程退出 · 剩余并行轮次={left}")
+                self.after(0, self._finish_ui if not still else self._refresh_stats)
 
-        self.worker = threading.Thread(target=run, daemon=True)
-        self.worker.start()
+        t = threading.Thread(target=run, daemon=True, name=f"vps-round-{rnd}")
+        self.worker = t
+        self._workers = [w for w in self._workers if w.is_alive()]
+        self._workers.append(t)
+        t.start()
 
     def _run_many(
         self,
@@ -601,16 +658,22 @@ class App(tk.Tk):
 
     def _request_stop(self) -> None:
         self.stop_flag = True
-        self.log_q.put("已请求停止：未开始的任务将跳过，进行中的会跑完")
+        self.log_q.put(
+            f"已请求停止：所有并行轮次中未开始的任务将跳过，进行中的会跑完（并行={self._active_rounds}）"
+        )
 
     def _finish_ui(self) -> None:
         self.btn_start.configure(state=tk.NORMAL)
-        self.btn_stop.configure(state=tk.DISABLED)
+        if self._active_rounds <= 0:
+            self.btn_stop.configure(state=tk.DISABLED)
         self._refresh_stats()
 
     def _on_close(self) -> None:
-        if self.running:
-            if not messagebox.askokcancel("退出", "任务仍在运行，确定退出？"):
+        if self._active_rounds > 0 or self.running:
+            if not messagebox.askokcancel(
+                "退出",
+                f"仍有 {max(self._active_rounds, 1)} 轮任务在运行，确定退出？",
+            ):
                 return
             self.stop_flag = True
         self._stop_schedule()

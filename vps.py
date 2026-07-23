@@ -47,6 +47,7 @@ from bohrium_create_node import (  # noqa: E402
     DEFAULT_IMAGE_ID,
     DEFAULT_PLATFORM,
     DEFAULT_SKU_ID,
+    DEFAULT_SKU_LABEL,
     DEFAULT_TURNOFF_AFTER,
     DEVICE_CONTAINER,
     create_node,
@@ -73,6 +74,9 @@ DEFAULT_REPO = (
 DEFAULT_MODE = "bootstrap"  # bootstrap | mine
 DEFAULT_PRODUCT = "node"  # node=Start Nodes 容器；notebook=Run Notebooks
 DEFAULT_INFINITE = False  # True: 子机继续 bootstrap 无限递增；False: 子机仅 mine
+# fixed=只开指定 sku；desc=高配→低配递减回退
+DEFAULT_SKU_MODE = "fixed"
+DEFAULT_SKU_ID_FIXED = 388  # 新号免费额度友好
 DEFAULT_OUT = ROOT / "vps_result.json"
 DEFAULT_COUNT = 20
 DEFAULT_WORKERS = 20
@@ -267,11 +271,13 @@ def build_remote_cmds(
     rr = max(int(remote_retries), 0)
     # Keep CLI flags stable for old already-running infinite parents:
     # --mode / --infinite / --wallet / --remote-* must remain recognized.
+    # Children use fixed cheap SKU by default (new-account friendly).
+    sku_flags = f"--sku-mode fixed --sku-id {DEFAULT_SKU_ID_FIXED}"
     if infinite:
         # 子机继续 bootstrap + infinite，实现无限递增
         child_cmd = (
             f"python3 vps.py --no-proxy --count {rc} --workers {rw} --retries {rr} "
-            f"--mode bootstrap --infinite "
+            f"--mode bootstrap --infinite {sku_flags} "
             f"--remote-count {rc} --remote-workers {rw} --remote-retries {rr} "
             f"--repo {repo_q} --wallet {wallet_q}"
         )
@@ -280,9 +286,47 @@ def build_remote_cmds(
         # 子机只挖矿，停止递增
         child_cmd = (
             f"python3 vps.py --no-proxy --count {rc} --workers {rw} --retries {rr} "
-            f"--mode mine --wallet {wallet_q}"
+            f"--mode mine {sku_flags} --wallet {wallet_q}"
         )
         spawn_label = "克隆仓库并启动二阶开号挖矿"
+
+    # Multiple clone mirrors: raw github often fails (exit 128) on CN VPS.
+    repo_git = repo
+    if repo.endswith(".git"):
+        repo_zip = repo[:-4] + "/archive/refs/heads/main.tar.gz"
+    else:
+        repo_zip = repo.rstrip("/") + "/archive/refs/heads/main.tar.gz"
+    mirrors = []
+    for u in (
+        repo,
+        repo_proxy,
+        "https://gitclone.com/" + repo.replace("https://", ""),
+        "https://ghfast.top/" + repo,
+        "https://mirror.ghproxy.com/" + repo,
+        "https://ghproxy.net/" + repo,
+        "https://gh.ddlc.top/" + repo,
+    ):
+        if u and u not in mirrors:
+            mirrors.append(u)
+    clone_tries = "\n".join(
+        f'  git clone --depth 1 {_sh_quote(u)} /root/bohrium-vps-pipeline && break\n'
+        f'  rm -rf /root/bohrium-vps-pipeline\n'
+        for u in mirrors
+    )
+    # tarball fallback (no full git history needed)
+    tar_mirrors = [
+        repo_zip,
+        "https://mirror.ghproxy.com/" + repo_zip,
+        "https://ghfast.top/" + repo_zip,
+    ]
+    tar_tries = "\n".join(
+        "  rm -rf /tmp/bvp.tgz /tmp/bvp_extract\n"
+        f"  if curl -fsSL --connect-timeout 20 --max-time 180 {_sh_quote(u)} -o /tmp/bvp.tgz; then\n"
+        "    mkdir -p /tmp/bvp_extract && tar -xzf /tmp/bvp.tgz -C /tmp/bvp_extract && "
+        "mv /tmp/bvp_extract/* /root/bohrium-vps-pipeline && break\n"
+        "  fi\n"
+        for u in tar_mirrors
+    )
 
     bootstrap = (
         "set -e\n"
@@ -290,17 +334,35 @@ def build_remote_cmds(
         "export PYTHONUNBUFFERED=1\n"
         "if command -v apt-get >/dev/null 2>&1; then\n"
         "  apt-get update -y || true\n"
-        "  apt-get install -y git python3 python3-pip python3-venv curl ca-certificates || true\n"
+        "  apt-get install -y git python3 python3-pip python3-venv curl ca-certificates tar || true\n"
         "elif command -v yum >/dev/null 2>&1; then\n"
-        "  yum install -y git python3 python3-pip curl ca-certificates || true\n"
+        "  yum install -y git python3 python3-pip curl ca-certificates tar || true\n"
         "fi\n"
         "rm -rf /root/bohrium-vps-pipeline\n"
-        f"git clone --depth 1 {repo_q} /root/bohrium-vps-pipeline "
-        f"|| git clone --depth 1 {repo_proxy_q} /root/bohrium-vps-pipeline\n"
+        "CLONE_OK=0\n"
+        "for _try in 1 2 3; do\n"
+        f"{clone_tries}"
+        "  if [ -d /root/bohrium-vps-pipeline/.git ] || [ -f /root/bohrium-vps-pipeline/vps.py ]; then CLONE_OK=1; break; fi\n"
+        "  sleep 2\n"
+        "done\n"
+        "if [ \"$CLONE_OK\" != \"1\" ]; then\n"
+        "  mkdir -p /root/bohrium-vps-pipeline\n"
+        f"{tar_tries}"
+        "  if [ -f /root/bohrium-vps-pipeline/vps.py ]; then CLONE_OK=1; fi\n"
+        "fi\n"
+        "if [ \"$CLONE_OK\" != \"1\" ]; then\n"
+        "  echo CLONE_FAILED\n"
+        "  # still start mining so the node is not idle\n"
+        f"  nohup bash -c {mine_bash_q} >/root/self_mine.log 2>&1 &\n"
+        "  exit 128\n"
+        "fi\n"
         "cd /root/bohrium-vps-pipeline\n"
         "python3 -m pip install -U pip -q -i https://pypi.tuna.tsinghua.edu.cn/simple || true\n"
         "python3 -m pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple "
-        "|| python3 -m pip install -r requirements.txt -q\n"
+        "|| python3 -m pip install -r requirements.txt -q || true\n"
+        # Minimal deps if requirements heavy (opencv) fails on tiny disk
+        "python3 -m pip install -q requests paramiko urllib3 curl_cffi "
+        "-i https://pypi.tuna.tsinghua.edu.cn/simple || true\n"
         f"nohup bash -c {mine_bash_q} >/root/self_mine.log 2>&1 &\n"
         f"nohup {child_cmd} >/root/vps_spawn.log 2>&1 &\n"
         "SPID=$!\n"
@@ -329,6 +391,7 @@ def run_pipeline_once(
     mail_timeout: int = 90,
     require_captcha: bool = False,
     sku_id: int | None = None,
+    sku_mode: str = DEFAULT_SKU_MODE,
     image_id: int = DEFAULT_IMAGE_ID,
     disk_size: int = DEFAULT_DISK,
     project_id: int | None = None,
@@ -422,24 +485,34 @@ def run_pipeline_once(
     result["stage"] = "create_node"
     result["product"] = product
     node_name = name or ("vps-%s-%02d" % (time.strftime("%m%d%H%M%S"), task_id))
+    mode_norm = str(sku_mode or DEFAULT_SKU_MODE).strip().lower()
+    sku_fallback = mode_norm in ("desc", "fallback", "auto", "decrement")
+    use_sku: int | None
+    if sku_fallback:
+        # desc: start from preferred (or high rank); allow cheaper fallback
+        use_sku = int(sku_id) if sku_id is not None else None
+    else:
+        # fixed: only this sku (default 388)
+        use_sku = int(sku_id) if sku_id is not None else DEFAULT_SKU_ID_FIXED
     try:
         if product == "notebook":
             log_info(
-                "%s 启动 Notebook name=%s sku=%s disk=%s",
+                "%s 启动 Notebook name=%s sku=%s mode=%s disk=%s",
                 tag,
                 node_name,
-                sku_id,
+                use_sku if use_sku is not None else "auto",
+                "desc" if sku_fallback else "fixed",
                 disk_size,
             )
             created_nb = create_notebook_runtime(
                 token=use_token,
                 proxy=proxy,
-                sku_id=sku_id,
+                sku_id=use_sku,
                 disk_size=disk_size,
                 image_id=image_id,
                 wait=True,
-                wait_timeout=180.0,
-                sku_fallback=True,
+                wait_timeout=3600.0,
+                sku_fallback=sku_fallback,
             )
             create_data = notebook_to_dict(created_nb)
             # normalize fields used by _node_hosts / print
@@ -470,10 +543,11 @@ def run_pipeline_once(
             )
         else:
             log_info(
-                "%s 创建节点(Start Nodes/容器) name=%s sku=%s image=%s disk=%s project=%s",
+                "%s 创建节点(Start Nodes/容器) name=%s sku=%s mode=%s image=%s disk=%s project=%s",
                 tag,
                 node_name,
-                sku_id,
+                use_sku if use_sku is not None else "auto",
+                "desc" if sku_fallback else "fixed",
                 image_id,
                 disk_size,
                 project_id if project_id is not None else "自动",
@@ -482,7 +556,7 @@ def run_pipeline_once(
                 token=use_token,
                 proxy=proxy,
                 target_price=None,
-                sku_id=sku_id,
+                sku_id=use_sku,
                 project_id=project_id,
                 disk_size=disk_size,
                 name=node_name,
@@ -492,8 +566,8 @@ def run_pipeline_once(
                 device=DEVICE_CONTAINER,
                 dry_run=False,
                 wait=True,
-                sku_fallback=True,
-                wait_timeout=180.0,
+                sku_fallback=sku_fallback,
+                wait_timeout=3600.0,
             )
             create_data = create_to_dict(created)
             result["create"] = create_data
@@ -629,13 +703,33 @@ def run_pipeline_once(
             if code != 0:
                 detail = err_clean or out_clean or f"exit={code}"
                 log_warn("%s %s 返回码=%s：%s", tag, title, code, short_error(detail))
+                # bootstrap exit 128 = git clone failed (CN network); node may still mine
+                if code == 128 or "CLONE_FAILED" in (out_text or "") + (err_text or ""):
+                    ssh_info["clone_failed"] = True
+                    result["error"] = short_error(detail)[:220]
+                else:
+                    ssh_info["cmd_failed"] = True
+                    result["error"] = short_error(detail)[:220]
             else:
                 log_info("%s %s 完成", tag, title)
 
-        ssh_info["ok"] = True
-        result["ok"] = True
-        result["stage"] = "done"
-        log_info("%s 全部完成", tag)
+        # Node/SSH ok even if remote clone failed: mining may still run; expand may not.
+        clone_fail = bool(ssh_info.get("clone_failed"))
+        cmd_fail = bool(ssh_info.get("cmd_failed"))
+        ssh_info["ok"] = not cmd_fail
+        result["ok"] = not cmd_fail
+        if clone_fail and not cmd_fail:
+            # partial: registered+node+mine path, but infinite spawn likely missing
+            result["ok"] = True
+            result["stage"] = "done_partial"
+            result["error"] = result.get("error") or "remote git clone failed (exit 128); mining may still run"
+            log_warn("%s 完成(部分)：克隆失败，递增可能未启动", tag)
+        elif result["ok"]:
+            result["stage"] = "done"
+            log_info("%s 全部完成", tag)
+        else:
+            result["stage"] = "ssh_run"
+            log_err("%s 远程命令失败", tag)
     except Exception as exc:  # noqa: BLE001
         err = short_error(exc)
         result["error"] = err
@@ -785,10 +879,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--require-captcha", action="store_true", help="强制打码")
 
     p.add_argument(
+        "--sku-mode",
+        default=DEFAULT_SKU_MODE,
+        choices=["fixed", "desc"],
+        help="SKU 策略：fixed=只开指定机型（默认）；desc=高配→低配递减回退",
+    )
+    p.add_argument(
         "--sku-id",
         type=int,
         default=None,
-        help="固定机型 skuId；默认不指定，按高配→低配依次尝试",
+        help=f"机型 skuId；fixed 默认 {DEFAULT_SKU_ID_FIXED}；desc 时作优先起点（可省略=全表递减）",
     )
     p.add_argument("--image-id", type=int, default=DEFAULT_IMAGE_ID)
     p.add_argument("--disk-size", type=int, default=DEFAULT_DISK)
@@ -902,6 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
         "mail_timeout": args.mail_timeout,
         "require_captcha": args.require_captcha,
         "sku_id": args.sku_id,
+        "sku_mode": args.sku_mode,
         "image_id": args.image_id,
         "disk_size": args.disk_size,
         "project_id": args.project_id,
@@ -923,12 +1024,14 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     log_info(
-        "启动：任务数=%s 线程=%s 重试=%s 产品=%s 模式=%s 无限递增=%s 代理=%s",
+        "启动：任务数=%s 线程=%s 重试=%s 产品=%s 模式=%s SKU模式=%s sku=%s 无限递增=%s 代理=%s",
         count,
         workers,
         retries,
         args.product,
         args.mode,
+        args.sku_mode,
+        args.sku_id if args.sku_id is not None else (DEFAULT_SKU_ID_FIXED if args.sku_mode == "fixed" else "auto"),
         base_kwargs["infinite"],
         proxy or "无",
     )

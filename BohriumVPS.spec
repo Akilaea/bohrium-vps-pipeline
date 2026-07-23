@@ -1,13 +1,43 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for Windows Server standalone package
 
+from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
+
 block_cipher = None
+
+# Pull OpenCV / numpy binaries (cv2 is required by captcha solvers)
+extra_datas = [
+    ('bypass', 'bypass'),
+    ('captcha_multi.py', '.'),
+]
+extra_binaries = []
+extra_hidden = []
+
+for pkg in ('cv2', 'numpy', 'curl_cffi', 'onnxruntime', 'ddddocr'):
+    try:
+        d, b, h = collect_all(pkg)
+        extra_datas += d
+        extra_binaries += b
+        extra_hidden += h
+    except Exception:
+        pass
+
+try:
+    extra_binaries += collect_dynamic_libs('cv2')
+except Exception:
+    pass
 
 a = Analysis(
     ['ui.py'],
-    pathex=[],
-    binaries=[],
-    datas=[],
+    pathex=[
+        '.',
+        'bypass',
+        'bypass/slide',
+        'bypass/image',
+        'bypass/text',
+    ],
+    binaries=extra_binaries,
+    datas=extra_datas,
     hiddenimports=[
         'vps',
         'bohrium_register',
@@ -15,13 +45,27 @@ a = Analysis(
         'bohrium_ssh',
         'bohrium_notebook',
         'paths',
+        'captcha_multi',
+        'captcha_runtime',
+        'slide_solver',
+        'image_solver',
+        'text_solver',
+        'cv2',
+        'numpy',
+        'numpy.core',
+        'numpy.core._multiarray_umath',
+        'onnxruntime',
+        'curl_cffi',
+        'curl_cffi.requests',
         'paramiko',
         'requests',
         'urllib3',
         'cryptography',
         'nacl',
         'bcrypt',
-    ],
+        'PIL',
+        'PIL.Image',
+    ] + list(extra_hidden),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

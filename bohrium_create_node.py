@@ -55,10 +55,10 @@ _API_COOLDOWN_LOCK = threading.Lock()
 _RELEASE_SWEEP_LOCK = threading.Lock()
 _LAST_RELEASE_SWEEP = 0.0
 
-# empirically verified 0.4 CNY/h SKU on prod
+# empirically verified 0.4 CNY/h SKU on prod (new-account friendly)
 TARGET_PRICE = None
-DEFAULT_SKU_ID = 419
-DEFAULT_SKU_LABEL = "sku-419"
+DEFAULT_SKU_ID = 388
+DEFAULT_SKU_LABEL = "c2_m4_cpu"
 DEFAULT_DISK = 20
 DEFAULT_IMAGE_ID = 37611
 # Start Nodes only uses container (VM option removed as unsupported shell)
@@ -905,24 +905,45 @@ def node_is_terminal_fail(node: dict[str, Any] | None) -> bool:
     }
 
 
+# Resource queue: platform may take up to ~1h to assign IP/password.
+DEFAULT_WAIT_TIMEOUT = 3600.0
+DEFAULT_WAIT_INTERVAL = 5.0
+# Adaptive poll: fast early, then back off while waiting for capacity
+WAIT_FAST_UNTIL = 120.0
+WAIT_MID_UNTIL = 900.0
+WAIT_FAST_INTERVAL = 5.0
+WAIT_MID_INTERVAL = 15.0
+WAIT_SLOW_INTERVAL = 30.0
+
+
+def _wait_poll_interval(elapsed: float) -> float:
+    if elapsed < WAIT_FAST_UNTIL:
+        return WAIT_FAST_INTERVAL
+    if elapsed < WAIT_MID_UNTIL:
+        return WAIT_MID_INTERVAL
+    return WAIT_SLOW_INTERVAL
+
+
 def wait_node(
     client: BohriumNodeClient,
     node_id: int,
     *,
-    timeout: float = 180.0,
-    interval: float = 3.0,
+    timeout: float = DEFAULT_WAIT_TIMEOUT,
+    interval: float | None = None,
     require_credentials: bool = True,
+    adaptive: bool = True,
 ) -> dict[str, Any] | None:
     """Poll until Preparing/Creating finishes and credentials are ready.
 
-    Does NOT sleep a fixed wall-clock only: loops on node detail status.
-    status 0/1 = still preparing/waiting; status 2 + ip/pwd = done.
-    timeout is a safety ceiling for stuck prepares / empty inventory.
+    Capacity queue often returns status Running/Waiting without IP/pwd for a long
+    time (up to ~1 hour). Adaptive intervals avoid hammering the API while still
+    detecting delivery promptly.
     """
     deadline = time.time() + max(timeout, 5.0)
     last: dict[str, Any] | None = None
     last_sig = ""
     t0 = time.time()
+    next_heartbeat = t0 + 60.0
     while time.time() < deadline:
         data = client.node_list(queryType="private", orderBy="startTimeDesc")
         items = ((data.get("data") or {}).get("items") or [])
@@ -952,9 +973,9 @@ def wait_node(
                 f"{creds.get('status')}|{msg}|{creds.get('ip')}|"
                 f"{bool(creds.get('password'))}|{creds.get('estimate_start_time')}"
             )
+            elapsed = int(time.time() - t0)
             if sig != last_sig:
                 last_sig = sig
-                elapsed = int(time.time() - t0)
                 LOG.info(
                     "node prepare id=%s phase=%s elapsed=%ss ip=%s pwd=%s msg=%s est=%s",
                     node_id,
@@ -965,6 +986,19 @@ def wait_node(
                     msg or "-",
                     creds.get("estimate_start_time") or "-",
                 )
+            elif time.time() >= next_heartbeat:
+                # periodic heartbeat while still queuing for resources
+                left = max(0, int(deadline - time.time()))
+                LOG.info(
+                    "node monitor id=%s phase=%s elapsed=%ss left=%ss ip=%s pwd=%s (waiting resource)",
+                    node_id,
+                    st_label,
+                    elapsed,
+                    left,
+                    creds.get("ip") or "-",
+                    "yes" if creds.get("password") else "no",
+                )
+                next_heartbeat = time.time() + 60.0
             if node_is_terminal_fail(last):
                 LOG.warning(
                     "node %s terminal phase=%s — stop waiting",
@@ -984,7 +1018,13 @@ def wait_node(
                     creds.get("ip"),
                 )
                 return last
-        time.sleep(interval)
+        elapsed_f = time.time() - t0
+        sleep_s = (
+            _wait_poll_interval(elapsed_f)
+            if adaptive and interval is None
+            else float(interval if interval is not None else DEFAULT_WAIT_INTERVAL)
+        )
+        time.sleep(max(sleep_s, 1.0))
     if last is not None:
         creds = extract_credentials(last)
         try:
@@ -1131,7 +1171,7 @@ def create_node(
     dry_run: bool = False,
     wait: bool = True,
     sku_fallback: bool = True,
-    wait_timeout: float = 180.0,
+    wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
 ) -> CreateNodeResult:
     device = normalize_device(device)
     client = BohriumNodeClient(token, proxy=proxy)
@@ -1147,6 +1187,11 @@ def create_node(
         LOG.info("project id=%s name=%s", pid, project.get("name"))
 
         # Build SKU try-list: high-spec → low-spec (or single fixed SKU).
+        bal_value = _balance_value(bal)
+        try:
+            bal_value = max(bal_value, _balance_value(client.balance()))
+        except Exception:
+            pass
         sku_try: list[dict[str, Any]] = []
         if sku_fallback or sku_id is None:
             try:
@@ -1157,7 +1202,24 @@ def create_node(
                     cpu_only=True,
                     preferred_sku_id=sku_id or DEFAULT_SKU_ID,
                 )
-                sku_try = ranked
+                # Drop tiers clearly above wallet (new accounts ~200 free pts).
+                # Keep unpriced / non-numeric prices so fallback still tries them.
+                affordable: list[dict[str, Any]] = []
+                for item in ranked:
+                    try:
+                        p = float(item.get("price") or 0)
+                    except (TypeError, ValueError):
+                        p = 0.0
+                    if p <= 0 or bal_value <= 0 or p <= bal_value:
+                        affordable.append(item)
+                    else:
+                        LOG.info(
+                            "skip sku=%s price=%s > balance=%s",
+                            item.get("skuId"),
+                            p,
+                            bal_value,
+                        )
+                sku_try = affordable or ranked
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("list ranked skus failed: %s", exc)
         if not sku_try:
@@ -1328,22 +1390,32 @@ def create_node(
                         time.sleep(3.0)
                         continue
                     break
-                # Balance / free-credit race only
+                # Balance: free-credit race OR tier too expensive for wallet.
+                # Retry wait a couple times, then fall through to cheaper SKU.
                 if _is_balance_error(msg, code):
-                    if attempt >= 3:
-                        LOG.warning("balance still insufficient after retries; stop sku tries")
-                        break
-                    LOG.warning("balance transient code=%s; wait account ready (%s/3)", code, attempt)
-                    time.sleep(2.0 * attempt)
-                    try:
-                        project = wait_account_ready(
-                            client, project_id=project_id, min_balance=1.0, timeout=20.0, interval=2.0
+                    if attempt < 2:
+                        LOG.warning(
+                            "balance code=%s sku=%s; wait account ready (%s/2)",
+                            code,
+                            sid,
+                            attempt,
                         )
-                        pid = int(project.get("id") or project.get("projectId") or pid)
-                        payload["projectId"] = pid
-                    except Exception as exc:  # noqa: BLE001
-                        LOG.warning("re-wait account ready failed: %s", exc)
-                    continue
+                        time.sleep(1.5 * attempt)
+                        try:
+                            project = wait_account_ready(
+                                client, project_id=project_id, min_balance=1.0, timeout=12.0, interval=2.0
+                            )
+                            pid = int(project.get("id") or project.get("projectId") or pid)
+                            payload["projectId"] = pid
+                        except Exception as exc:  # noqa: BLE001
+                            LOG.warning("re-wait account ready failed: %s", exc)
+                        continue
+                    LOG.warning(
+                        "balance insufficient for sku=%s price=%s; try cheaper SKU",
+                        sid,
+                        sku.get("price"),
+                    )
+                    break
                 # Capacity / other → break inner loop, maybe next SKU
                 break
 
@@ -1356,8 +1428,15 @@ def create_node(
                     or create_resp
                 )
                 errors.append(f"sku={sid} add_fail: {str(msg)[:180]}")
-                if _is_auth_error(msg, code) or _is_balance_error(msg, code):
+                if _is_auth_error(msg, code):
                     LOG.warning("non-sku-switchable error, stop fallback: %s", str(msg)[:160])
+                    break
+                # Balance on this tier → try cheaper (do NOT stop entire fallback)
+                if _is_balance_error(msg, code) and sku_fallback and idx < len(sku_try):
+                    LOG.warning("sku=%s balance fail, try next lower price: %s", sid, str(msg)[:120])
+                    continue
+                if _is_balance_error(msg, code):
+                    LOG.warning("balance fail on last sku; stop: %s", str(msg)[:160])
                     break
                 if _is_rate_limited(msg, code):
                     LOG.warning("rate-limited during create; stop sku fallback (avoid 405 cascade)")
@@ -1377,16 +1456,21 @@ def create_node(
             node_id = int(((create_resp.get("data") or {}).get("id")) or 0) or None
             node_info = None
             if wait and node_id:
-                # Wait on Preparing/Creating progress (status 0/1 → 2 Running + pwd),
-                # not a blind sleep. timeout is only a stuck-prepare ceiling.
-                # Intermediate SKUs use a shorter ceiling so empty inventory falls
-                # through; last SKU uses full wait_timeout.
+                # Wait on Preparing/Creating / resource queue until IP+pwd.
+                # Intermediate SKUs: shorter so empty inventory falls through;
+                # last SKU (or fixed mode): full wait_timeout (default 1h).
                 remain = len(sku_try) - idx
                 to = float(wait_timeout)
                 if sku_fallback and remain > 0:
-                    to = min(to, 90.0)
+                    to = min(to, 300.0)
+                LOG.info(
+                    "node monitor start id=%s sku=%s timeout=%ss (resource may take up to 1h)",
+                    node_id,
+                    sid,
+                    int(to),
+                )
                 node_info = wait_node(
-                    client, node_id, timeout=to, interval=3, require_credentials=True
+                    client, node_id, timeout=to, require_credentials=True, adaptive=True
                 )
                 LOG.info("node info: %s", json.dumps(node_info or {}, ensure_ascii=False)[:500])
             # Learn real spec from detail ASAP (even if IP never arrives)
@@ -1426,15 +1510,35 @@ def create_node(
                     node_info=node_info,
                 )
 
-            # Node created but credentials never ready → release this node, optional next SKU
+            # Still queuing (Waiting/Running no IP) — do NOT release; resource may arrive later.
+            still_queuing = bool(node_info) and not node_is_terminal_fail(node_info)
             errors.append(f"sku={sid} node={node_id} no credentials in time")
+            if still_queuing:
+                LOG.warning(
+                    "node %s still queuing without IP/pwd after %ss — keep node, stop SKU tries",
+                    node_id,
+                    int(wait_timeout),
+                )
+                # Return pending node info so caller can resume monitor later
+                return CreateNodeResult(
+                    ok=False,
+                    node_id=node_id,
+                    price=price,
+                    sku_id=sid,
+                    sku_label=label,
+                    project_id=pid,
+                    payload=payload,
+                    create_resp=create_resp,
+                    node_info=node_info,
+                    error=f"node={node_id} still waiting for IP/password (queued; monitor later)",
+                )
+            # Terminal fail only: release and maybe next SKU
             if node_id:
                 try:
                     client.node_release(node_id)
                     time.sleep(1.5)
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("release node %s failed: %s", node_id, exc)
-            # Sweep at most every 15s globally (prevents 20-thread list storms → HTTP 405)
             try:
                 release_unready_nodes(client, keep_ready=True, min_interval=15.0)
             except Exception:
@@ -1501,7 +1605,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--proxy", default=DEFAULT_PROXY, help=f"HTTP proxy (default {DEFAULT_PROXY})")
     p.add_argument("--no-proxy", action="store_true")
     p.add_argument("--price", type=float, default=None, help="target hourly price in CNY")
-    p.add_argument("--sku-id", type=int, default=DEFAULT_SKU_ID, help="force skuId (default: 419)")
+    p.add_argument("--sku-id", type=int, default=DEFAULT_SKU_ID, help="force skuId (default: 388)")
     p.add_argument("--project-id", type=int, default=None, help="projectId; default auto-pick from current account")
     p.add_argument("--disk-size", type=int, default=DEFAULT_DISK)
     p.add_argument("--name", default=None, help="node name; random if omitted")
@@ -1515,6 +1619,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dry-run", action="store_true", help="only resolve sku/image/payload, do not create")
     p.add_argument("--no-wait", action="store_true", help="do not poll node list after create")
+    p.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=DEFAULT_WAIT_TIMEOUT,
+        help=f"wait for IP/password seconds (default {int(DEFAULT_WAIT_TIMEOUT)}; resource queue may need 1h)",
+    )
+    p.add_argument(
+        "--monitor-node",
+        type=int,
+        default=None,
+        help="only monitor an existing nodeId until IP/password ready (or timeout)",
+    )
     p.add_argument("--list-only", action="store_true", help="only list current nodes and prices")
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -1566,6 +1682,39 @@ def main(argv: list[str] | None = None) -> int:
             args.out.write_text(text, encoding="utf-8")
         return 0
 
+    if args.monitor_node is not None:
+        nid = int(args.monitor_node)
+        LOG.info(
+            "monitor existing node id=%s timeout=%ss (adaptive poll)",
+            nid,
+            int(args.wait_timeout),
+        )
+        info = wait_node(
+            client,
+            nid,
+            timeout=float(args.wait_timeout),
+            require_credentials=True,
+            adaptive=True,
+        )
+        creds = extract_credentials(info)
+        out = {
+            "ok": bool(creds.get("ip") and creds.get("password")),
+            "node_id": nid,
+            "ip": creds.get("ip"),
+            "username": creds.get("username"),
+            "password": creds.get("password"),
+            "status": creds.get("status"),
+            "node_info": info,
+        }
+        text = json.dumps(out, ensure_ascii=False, indent=2)
+        print(text)
+        if out["ok"]:
+            print_credentials(out)
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(text, encoding="utf-8")
+        return 0 if out["ok"] else 1
+
     node_name = args.name
     if not node_name:
         node_name = "node-%s" % time.strftime("%m%d%H%M%S")
@@ -1584,6 +1733,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         dry_run=args.dry_run,
         wait=not args.no_wait,
+        wait_timeout=float(args.wait_timeout),
     )
     payload = result_to_dict(result)
     text = json.dumps(payload, ensure_ascii=False, indent=2)

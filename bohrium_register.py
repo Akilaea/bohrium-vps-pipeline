@@ -4,9 +4,10 @@
 Flow (observed on https://platform.bohrium.com/login):
   1) create temporary mailbox
   2) optional Tencent slide captcha (aid=194611140, prod web)
-  3) POST /api/account/code/send_by_email
+  3) POST www bohrapi send_by_email
   4) poll temp mailbox for 6-digit code
-  5) POST /api/account/login/email_code  (auto-register unregistered email)
+  5) POST /api/oauth/login loginMethod=3 (EMAIL_CODE); token in brmToken cookie
+     (legacy fallback: /api/account/login/email_code — often WAF)
 
 Default HTTP proxy: http://127.0.0.1:7890
 """
@@ -57,7 +58,11 @@ WWW_API = f"{WWW}/bohrapi/v1"
 LOGIN_PAGE = f"{PLATFORM}/login"
 # 发码走 www 域名 bohrapi（platform 的 send_by_email 易被 WAF 405）
 SEND_CODE_URL = f"{WWW_API}/account/code/send_by_email"
+# 登录优先 oauth/login（loginMethod=3=EMAIL_CODE），email_code 仅兜底（易被 WAF）
+LOGIN_OAUTH_URL = f"{API}/oauth/login"
 LOGIN_EMAIL_URL = f"{API}/account/login/email_code"
+# Frontend enum: EMAIL_CODE
+LOGIN_METHOD_EMAIL_CODE = 3
 
 MAIL_API_URL = "https://mail.minecraft-cn.net"
 MAIL_DOMAIN = "olsbvgq.shop"
@@ -371,6 +376,42 @@ class BohriumClient:
         LOG.info("send email code response: %s", json.dumps(data, ensure_ascii=False)[:400])
         return data
 
+    def _cookie_token(self) -> str | None:
+        try:
+            jar = self.session.cookies.get_dict()
+        except Exception:
+            jar = {}
+        for key in ("brmToken", "sso-brmToken"):
+            val = jar.get(key)
+            if val:
+                return str(val)
+        # curl_cffi / multi-domain: scan cookie jar
+        try:
+            for c in self.session.cookies:
+                name = getattr(c, "name", None) or (c[0] if isinstance(c, (list, tuple)) else None)
+                value = getattr(c, "value", None) or (c[1] if isinstance(c, (list, tuple)) and len(c) > 1 else None)
+                if name in ("brmToken", "sso-brmToken") and value:
+                    return str(value)
+        except Exception:
+            pass
+        return None
+
+    def _attach_token_from_cookies(self, data: dict[str, Any]) -> dict[str, Any]:
+        """oauth/login often returns data=null; token is in Set-Cookie brmToken."""
+        if not isinstance(data, dict):
+            data = {"code": -1, "data": data}
+        token = None
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            token = inner.get("token") or inner.get("brmToken")
+        token = token or self._cookie_token()
+        if token:
+            if not isinstance(data.get("data"), dict) or data.get("data") is None:
+                data["data"] = {}
+            if isinstance(data["data"], dict) and not data["data"].get("token"):
+                data["data"]["token"] = token
+        return data
+
     def login_email_code(
         self,
         email: str,
@@ -383,8 +424,77 @@ class BohriumClient:
         captcha: CaptchaTicket | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        # Frontend (main.*.js) uses camelCase for email_code login
-        payload: dict[str, Any] = {
+        # Prefer /api/oauth/login (loginMethod=3 EMAIL_CODE). Avoids WAF on email_code.
+        oauth_payload: dict[str, Any] = {
+            "email": email,
+            "code": str(code),
+            "businessLine": BUSINESS_LINE,
+            "loginMethod": LOGIN_METHOD_EMAIL_CODE,
+            "channel": channel,
+            "device": device,
+            "ext": ext or "",
+            "refer": refer if refer is not None else {},
+        }
+        if captcha is not None:
+            oauth_payload["ticket"] = captcha.ticket
+            oauth_payload["randstr"] = captcha.randstr
+        if extra:
+            oauth_payload.update(extra)
+
+        headers = {
+            "Origin": PLATFORM,
+            "Referer": LOGIN_PAGE,
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        LOG.info(
+            "login via oauth/login loginMethod=%s -> %s captcha=%s",
+            LOGIN_METHOD_EMAIL_CODE,
+            email,
+            "yes" if captcha else "no",
+        )
+        resp = self.session.post(
+            LOGIN_OAUTH_URL,
+            json=oauth_payload,
+            headers=headers,
+            timeout=self.timeout,
+        )
+        body_snip = (resp.text or "")[:160].replace("\n", " ")
+        LOG.info(
+            "login via %s http=%s body~%s",
+            LOGIN_OAUTH_URL,
+            resp.status_code,
+            body_snip,
+        )
+        if resp.status_code < 400:
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"code": -1, "raw": (resp.text or "")[:500]}
+            data = self._attach_token_from_cookies(data)
+            token = None
+            if isinstance(data.get("data"), dict):
+                token = data["data"].get("token")
+            LOG.info(
+                "login via oauth/login http=%s code=%s has_token=%s",
+                resp.status_code,
+                data.get("code"),
+                bool(token),
+            )
+            if int(data.get("code", -1)) == 0 and token:
+                return data
+            if int(data.get("code", -1)) == 0:
+                # success body but cookie not yet visible — still return (register_once re-reads cookies)
+                return data
+            # business error: do not fall through silently if clearly bad code
+            if int(data.get("code", -1)) not in (-1,) and "aliyun_waf" not in (resp.text or ""):
+                return data
+
+        # Fallback: legacy /api/account/login/email_code
+        legacy: dict[str, Any] = {
             "email": email,
             "code": str(code),
             "businessLine": BUSINESS_LINE,
@@ -394,79 +504,43 @@ class BohriumClient:
             "ext": ext or "",
         }
         if captcha is not None:
-            payload["ticket"] = captcha.ticket
-            payload["randstr"] = captcha.randstr
+            legacy["ticket"] = captcha.ticket
+            legacy["randstr"] = captcha.randstr
         if extra:
-            payload.update(extra)
-        LOG.info(
-            "login/register email_code -> %s captcha=%s browser_tls=%s",
-            email,
-            "yes" if captcha else "no",
-            self.browser_tls,
+            legacy.update(extra)
+        LOG.warning("oauth/login not ok (http=%s), fallback email_code", resp.status_code)
+        resp2 = self.session.post(
+            LOGIN_EMAIL_URL,
+            json=legacy,
+            headers=headers,
+            timeout=self.timeout,
         )
-        headers = {
-            "Origin": PLATFORM,
-            "Referer": LOGIN_PAGE,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
-        last_err: Exception | None = None
-        data: dict[str, Any] = {}
-        for attempt in range(1, 4):
-            resp = self.session.post(
-                LOGIN_EMAIL_URL,
-                json=payload,
-                headers=headers,
-                timeout=self.timeout,
+        if resp2.status_code >= 400:
+            LOG.error(
+                "login email_code HTTP %s body=%s",
+                resp2.status_code,
+                (resp2.text or "")[:300],
             )
-            if resp.status_code == 405:
-                snippet = (resp.text or "")[:120].replace("\n", " ")
-                LOG.warning(
-                    "login email_code HTTP 405 (attempt %s/3) tls=%s body~%s",
-                    attempt,
-                    "curl_cffi" if self.browser_tls else "requests",
-                    snippet,
-                )
-                time.sleep(2.0 * attempt + random.uniform(0.3, 1.2))
-                last_err = RuntimeError(
-                    "login email_code HTTP 405 (WAF/gateway; browser TLS may help)"
-                )
-                # retry PascalCase once (older gateways)
-                if attempt == 2:
-                    pascal = {
-                        "Email": email,
-                        "Code": str(code),
-                        "BusinessLine": BUSINESS_LINE,
-                        "channel": channel,
-                        "device": device,
-                    }
-                    if captcha is not None:
-                        pascal["ticket"] = captcha.ticket
-                        pascal["randstr"] = captcha.randstr
-                    resp = self.session.post(
-                        LOGIN_EMAIL_URL,
-                        json=pascal,
-                        headers=headers,
-                        timeout=self.timeout,
-                    )
-                    if resp.status_code != 405:
-                        break
-                continue
-            break
-        else:
-            if last_err:
-                raise last_err
-        if resp.status_code >= 400:
-            LOG.error("login HTTP %s body=%s", resp.status_code, (resp.text or "")[:300])
-        resp.raise_for_status()
-        data = resp.json()
+            if resp.status_code < 400:
+                # return oauth body if it was JSON business response
+                try:
+                    return self._attach_token_from_cookies(resp.json())
+                except Exception:
+                    pass
+            resp2.raise_for_status()
+        try:
+            data2 = resp2.json()
+        except Exception:
+            raise RuntimeError(
+                f"login email_code HTTP {resp2.status_code} non-json: {(resp2.text or '')[:200]}"
+            )
+        data2 = self._attach_token_from_cookies(data2)
         LOG.info(
-            "login response code=%s keys=%s",
-            data.get("code"),
-            list((data.get("data") or {}).keys()) if isinstance(data.get("data"), dict) else type(data.get("data")),
+            "login email_code fallback code=%s has_token=%s",
+            data2.get("code"),
+            bool((data2.get("data") or {}).get("token") if isinstance(data2.get("data"), dict) else False),
         )
-        return data
+        return data2
 
     def auth_check(self, token: str | None = None) -> dict[str, Any]:
         headers = {}
