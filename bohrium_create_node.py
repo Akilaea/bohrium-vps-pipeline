@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -157,6 +158,26 @@ class BohriumNodeClient:
     def node_add(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.post("/bohrapi/v1/node/add", payload)
 
+    def node_release(self, node_id: int) -> dict[str, Any]:
+        """Best-effort release/stop of a stuck node so SKU fallback can continue."""
+        nid = int(node_id)
+        last: dict[str, Any] = {}
+        for path, body in (
+            ("/bohrapi/v1/node/release", {"id": nid, "nodeId": nid}),
+            ("/bohrapi/v1/node/stop", {"id": nid, "nodeId": nid}),
+            (f"/bohrapi/v1/node/{nid}/release", {"id": nid}),
+            (f"/bohrapi/v1/node/{nid}/stop", {"id": nid}),
+        ):
+            try:
+                last = self.post(path, body)
+                LOG.info("node release try %s -> %s", path, last)
+                if int(last.get("code", -1)) == 0:
+                    return last
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("release %s failed: %s", path, exc)
+                last = {"error": str(exc), "path": path}
+        return last
+
     def balance(self) -> dict[str, Any]:
         return self.get("/bohrapi/v1/account/user/integral")
 
@@ -263,10 +284,118 @@ def list_skus(client: BohriumNodeClient) -> list[dict[str, Any]]:
     body = data.get("data") or {}
     out: list[dict[str, Any]] = []
     for item in body.get("cpuList") or []:
-        out.append({"kind": "cpu", "label": item.get("label"), "skuId": int(item.get("value"))})
+        out.append({"kind": "cpu", "label": item.get("label"), "skuId": int(item.get("value")), **item})
     for item in body.get("gpuList") or []:
-        out.append({"kind": "gpu", "label": item.get("label"), "skuId": int(item.get("value"))})
+        out.append({"kind": "gpu", "label": item.get("label"), "skuId": int(item.get("value")), **item})
     return out
+
+
+def parse_sku_spec(sku: dict[str, Any]) -> tuple[int, float]:
+    """Return (cpu_cores, mem_gb) from label / known fields. Best-effort."""
+    cpu = 0
+    mem = 0.0
+    for key in ("cpu", "cpuNum", "cpuCore", "cores", "vcpus"):
+        try:
+            v = int(sku.get(key) or 0)
+            if v > 0:
+                cpu = v
+                break
+        except (TypeError, ValueError):
+            pass
+    for key in ("memory", "mem", "memGb", "memoryGb", "ram"):
+        try:
+            v = float(sku.get(key) or 0)
+            if v > 0:
+                mem = v
+                break
+        except (TypeError, ValueError):
+            pass
+    text = " ".join(
+        str(sku.get(k) or "")
+        for k in ("label", "name", "spec", "value", "skuId")
+    )
+    # c64_m128 / 64c128g / 64核128G / 64C 128GB
+    m = re.search(r"[cC](\d+)\s*[_\-]?[mM](\d+)", text)
+    if m:
+        cpu = max(cpu, int(m.group(1)))
+        mem = max(mem, float(m.group(2)))
+    m = re.search(r"(\d+)\s*[核cC]\s*(\d+(?:\.\d+)?)\s*[Gg]", text)
+    if m:
+        cpu = max(cpu, int(m.group(1)))
+        mem = max(mem, float(m.group(2)))
+    m = re.search(r"(\d+)\s*[Cc](?:ore)?s?\b", text)
+    if m and cpu <= 0:
+        cpu = int(m.group(1))
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[Gg](?:i?B)?", text)
+    if m and mem <= 0:
+        mem = float(m.group(1))
+    if cpu <= 0:
+        try:
+            cpu = int(sku.get("skuId") or 0) % 1000
+        except Exception:
+            cpu = 0
+    return cpu, mem
+
+
+def list_skus_ranked(
+    client: BohriumNodeClient,
+    project_id: int,
+    *,
+    disk: int = DEFAULT_DISK,
+    cpu_only: bool = True,
+    preferred_sku_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch SKUs and sort high-spec → low-spec (cpu, mem, price desc)."""
+    skus = list_skus(client)
+    if cpu_only:
+        skus = [s for s in skus if str(s.get("kind") or "").lower() != "gpu"]
+    ranked: list[dict[str, Any]] = []
+    for sku in skus:
+        sid = int(sku["skuId"])
+        cpu, mem = parse_sku_spec(sku)
+        price_val = 0.0
+        price_str = ""
+        try:
+            price_resp = client.resource_price(sid, project_id, disk=disk)
+            if int(price_resp.get("code", -1)) == 0:
+                price_str = str((price_resp.get("data") or {}).get("price") or "")
+                price_val = float(price_str or 0)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("price sku=%s failed: %s", sid, exc)
+        row = {
+            **sku,
+            "skuId": sid,
+            "cpu": cpu,
+            "mem": mem,
+            "price": price_str,
+            "price_val": price_val,
+            "label": sku.get("label") or f"sku-{sid}",
+        }
+        ranked.append(row)
+        LOG.info(
+            "sku candidate id=%s label=%s cpu=%s mem=%s price=%s",
+            sid,
+            row["label"],
+            cpu,
+            mem,
+            price_str or "-",
+        )
+    # high → low: cpu, mem, price, then preferred first among equals
+    # high → low: cpu, mem, hourly price
+    ranked.sort(
+        key=lambda x: (
+            int(x.get("cpu") or 0),
+            float(x.get("mem") or 0),
+            float(x.get("price_val") or 0),
+            int(x["skuId"]),
+        ),
+        reverse=True,
+    )
+    LOG.info(
+        "sku order (high→low): %s",
+        ", ".join(f"{x['skuId']}({x.get('label')})" for x in ranked[:20]),
+    )
+    return ranked
 
 
 def find_sku_by_price(
@@ -435,6 +564,31 @@ def wait_node(
     return last
 
 
+def _sku_fail_is_capacity(msg: str, code: int) -> bool:
+    m = (msg or "").lower()
+    keys = (
+        "insufficient",
+        "stock",
+        "capacity",
+        "resource",
+        "sold out",
+        "no available",
+        "not enough",
+        "quota",
+        "库存",
+        "不足",
+        "无可用",
+        "售罄",
+        "资源",
+        "排队",
+        "繁忙",
+    )
+    if any(k in m for k in keys):
+        return True
+    # business codes that often mean capacity / schedule fail
+    return code in {148888, 140404, 500, 400}
+
+
 def create_node(
     *,
     token: str,
@@ -450,6 +604,8 @@ def create_node(
     device: str = DEFAULT_DEVICE,
     dry_run: bool = False,
     wait: bool = True,
+    sku_fallback: bool = True,
+    wait_timeout: float = 120.0,
 ) -> CreateNodeResult:
     client = BohriumNodeClient(token, proxy=proxy)
     try:
@@ -463,34 +619,53 @@ def create_node(
         pid = int(project.get("id") or project.get("projectId"))
         LOG.info("project id=%s name=%s", pid, project.get("name"))
 
-        if sku_id is None:
-            sku, price = find_sku_by_price(
-                client,
-                pid,
-                target_price=target_price,
-                disk=disk_size,
-                preferred_sku_id=DEFAULT_SKU_ID,
-            )
-            sid = int(sku["skuId"])
-            label = str(sku.get("label") or "")
-        else:
-            sid = int(sku_id)
-            price_resp = client.resource_price(sid, pid, disk=disk_size)
-            if int(price_resp.get("code", -1)) != 0:
-                raise RuntimeError(f"price query failed: {price_resp}")
-            price = str((price_resp.get("data") or {}).get("price") or "")
-            label = DEFAULT_SKU_LABEL if sid == DEFAULT_SKU_ID else str(sid)
-            # still validate target price if user wants 0.4
-            if target_price is not None and price:
-                if abs(float(price) - float(target_price)) > 1e-9:
-                    LOG.warning("sku=%s price=%s differs from target=%s", sid, price, target_price)
+        # Build SKU try-list: high-spec → low-spec (or single fixed SKU).
+        sku_try: list[dict[str, Any]] = []
+        if sku_fallback or sku_id is None:
+            try:
+                ranked = list_skus_ranked(
+                    client,
+                    pid,
+                    disk=disk_size,
+                    cpu_only=True,
+                    preferred_sku_id=sku_id or DEFAULT_SKU_ID,
+                )
+                sku_try = ranked
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("list ranked skus failed: %s", exc)
+        if not sku_try:
+            if sku_id is not None:
+                sid0 = int(sku_id)
+                price_resp = client.resource_price(sid0, pid, disk=disk_size)
+                price0 = str((price_resp.get("data") or {}).get("price") or "")
+                sku_try = [
+                    {
+                        "skuId": sid0,
+                        "label": DEFAULT_SKU_LABEL if sid0 == DEFAULT_SKU_ID else str(sid0),
+                        "price": price0,
+                    }
+                ]
+            elif target_price is not None:
+                sku, price = find_sku_by_price(
+                    client,
+                    pid,
+                    target_price=target_price,
+                    disk=disk_size,
+                    preferred_sku_id=DEFAULT_SKU_ID,
+                )
+                sku_try = [{**sku, "price": price}]
+            else:
+                sku_try = [{"skuId": DEFAULT_SKU_ID, "label": DEFAULT_SKU_LABEL, "price": ""}]
+
+        # If user fixed sku_id without fallback, only that SKU; with fallback keep pure high→low.
+        if sku_id is not None and not sku_fallback:
+            sku_try = [x for x in sku_try if int(x["skuId"]) == int(sku_id)] or [
+                {"skuId": int(sku_id), "label": str(sku_id), "price": ""}
+            ]
 
         image_version = None
         resolved_image_id = int(image_id)
         resolved_image_name = image_name
-        # If caller already passes a concrete imageId from the UI form (e.g. 37611),
-        # use it directly. Only resolve via public image family when version_id/image_name
-        # are provided, or when image_id still looks like a family id.
         if version_id is not None or image_name:
             image_version = pick_cpu_image_version(
                 client,
@@ -514,86 +689,163 @@ def create_node(
         else:
             LOG.info("using direct imageId=%s (skip public image version resolve)", resolved_image_id)
 
-        payload = build_add_payload(
-            project_id=pid,
-            sku_id=sid,
-            name=name,
-            disk_size=disk_size,
-            image_version=image_version,
-            image_id=resolved_image_id,
-            image_name=resolved_image_name,
-            device=device,
-            platform=DEFAULT_PLATFORM,
-            turnoff_after=DEFAULT_TURNOFF_AFTER,
-            datasets=DEFAULT_DATASETS,
-        )
-        LOG.info("create payload: %s", payload)
         if dry_run:
+            first = sku_try[0]
+            payload = build_add_payload(
+                project_id=pid,
+                sku_id=int(first["skuId"]),
+                name=name,
+                disk_size=disk_size,
+                image_version=image_version,
+                image_id=resolved_image_id,
+                image_name=resolved_image_name,
+                device=device,
+                platform=DEFAULT_PLATFORM,
+                turnoff_after=DEFAULT_TURNOFF_AFTER,
+                datasets=DEFAULT_DATASETS,
+            )
             return CreateNodeResult(
                 ok=True,
-                price=price,
-                sku_id=sid,
-                sku_label=label,
+                price=str(first.get("price") or ""),
+                sku_id=int(first["skuId"]),
+                sku_label=str(first.get("label") or first["skuId"]),
                 project_id=pid,
-                payload=payload,
+                payload={**payload, "sku_try": [int(x["skuId"]) for x in sku_try]},
                 error=None,
             )
 
-        create_resp: dict[str, Any] | None = None
-        for attempt in range(1, 6):
-            create_resp = client.node_add(payload)
-            LOG.info("create resp attempt=%s: %s", attempt, create_resp)
-            code = int(create_resp.get("code", -1))
-            if code == 0:
-                break
-            msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
-            # Transient: free credits / project init race right after register
-            if code in {148888, 140404} or "balance" in msg.lower() or "project" in msg.lower():
-                LOG.warning("node/add transient fail code=%s msg=%s; retry %s/5", code, msg, attempt)
-                time.sleep(3.0 * attempt)
+        errors: list[str] = []
+        last_payload: dict[str, Any] = {}
+        last_create: dict[str, Any] | None = None
+        last_price = ""
+        last_sid = int(sku_try[0]["skuId"])
+        last_label = str(sku_try[0].get("label") or last_sid)
+
+        for idx, sku in enumerate(sku_try, start=1):
+            sid = int(sku["skuId"])
+            label = str(sku.get("label") or sid)
+            price = str(sku.get("price") or "")
+            if not price:
                 try:
-                    project = wait_account_ready(
-                        client, project_id=project_id, min_balance=1.0, timeout=30.0, interval=2.0
-                    )
-                    pid = int(project.get("id") or project.get("projectId") or pid)
-                    payload["projectId"] = pid
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning("re-wait account ready failed: %s", exc)
-                continue
-            break
-        assert create_resp is not None
-        if int(create_resp.get("code", -1)) != 0:
-            return CreateNodeResult(
-                ok=False,
-                price=price,
-                sku_id=sid,
-                sku_label=label,
-                project_id=pid,
-                payload=payload,
-                create_resp=create_resp,
-                error=f"node/add failed: {create_resp}",
+                    pr = client.resource_price(sid, pid, disk=disk_size)
+                    price = str((pr.get("data") or {}).get("price") or "")
+                except Exception:
+                    price = ""
+            last_sid, last_label, last_price = sid, label, price
+            LOG.info(
+                "try sku %s/%s id=%s label=%s price=%s cpu=%s mem=%s",
+                idx,
+                len(sku_try),
+                sid,
+                label,
+                price or "-",
+                sku.get("cpu"),
+                sku.get("mem"),
             )
-        node_id = int(((create_resp.get("data") or {}).get("id")) or 0) or None
-        node_info = None
-        if wait and node_id:
-            node_info = wait_node(client, node_id, timeout=180, interval=3, require_credentials=True)
-            LOG.info("node info: %s", json.dumps(node_info or {}, ensure_ascii=False)[:500])
-        creds = extract_credentials(node_info)
-        status_val = creds.get("status")
+            payload = build_add_payload(
+                project_id=pid,
+                sku_id=sid,
+                name=name if idx == 1 else f"{name}-s{sid}",
+                disk_size=disk_size,
+                image_version=image_version,
+                image_id=resolved_image_id,
+                image_name=resolved_image_name,
+                device=device,
+                platform=DEFAULT_PLATFORM,
+                turnoff_after=DEFAULT_TURNOFF_AFTER,
+                datasets=DEFAULT_DATASETS,
+            )
+            last_payload = payload
+
+            create_resp: dict[str, Any] | None = None
+            for attempt in range(1, 4):
+                create_resp = client.node_add(payload)
+                LOG.info("create resp sku=%s attempt=%s: %s", sid, attempt, create_resp)
+                last_create = create_resp
+                code = int(create_resp.get("code", -1))
+                if code == 0:
+                    break
+                msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
+                if code in {148888, 140404} or "balance" in msg.lower() or "project" in msg.lower():
+                    LOG.warning("node/add transient code=%s msg=%s; retry", code, msg)
+                    time.sleep(2.0 * attempt)
+                    try:
+                        project = wait_account_ready(
+                            client, project_id=project_id, min_balance=1.0, timeout=20.0, interval=2.0
+                        )
+                        pid = int(project.get("id") or project.get("projectId") or pid)
+                        payload["projectId"] = pid
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning("re-wait account ready failed: %s", exc)
+                    continue
+                break
+
+            assert create_resp is not None
+            code = int(create_resp.get("code", -1))
+            if code != 0:
+                msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
+                errors.append(f"sku={sid} add_fail: {msg}")
+                if sku_fallback and _sku_fail_is_capacity(msg, code) and idx < len(sku_try):
+                    LOG.warning("sku=%s unavailable, try next lower spec", sid)
+                    continue
+                if not sku_fallback or idx >= len(sku_try):
+                    break
+                continue
+
+            node_id = int(((create_resp.get("data") or {}).get("id")) or 0) or None
+            node_info = None
+            if wait and node_id:
+                # shorter wait when more SKUs remain so we can fall through faster
+                remain = len(sku_try) - idx
+                to = float(wait_timeout)
+                if sku_fallback and remain > 0:
+                    to = min(to, 90.0)
+                node_info = wait_node(
+                    client, node_id, timeout=to, interval=3, require_credentials=True
+                )
+                LOG.info("node info: %s", json.dumps(node_info or {}, ensure_ascii=False)[:500])
+            creds = extract_credentials(node_info)
+            if creds.get("ip") and creds.get("password"):
+                status_val = creds.get("status")
+                return CreateNodeResult(
+                    ok=True,
+                    node_id=node_id,
+                    price=price,
+                    sku_id=sid,
+                    sku_label=label,
+                    project_id=pid,
+                    ip=creds.get("ip"),
+                    username=creds.get("username"),
+                    password=creds.get("password"),
+                    status=int(status_val)
+                    if status_val is not None and str(status_val).isdigit()
+                    else status_val,
+                    payload=payload,
+                    create_resp=create_resp,
+                    node_info=node_info,
+                )
+
+            # Node created but credentials never ready → release and try lower SKU
+            errors.append(f"sku={sid} node={node_id} no credentials in time")
+            if node_id:
+                try:
+                    client.node_release(node_id)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("release node %s failed: %s", node_id, exc)
+            if not sku_fallback or idx >= len(sku_try):
+                break
+            LOG.warning("sku=%s not ready, fallback to next lower spec", sid)
+            continue
+
         return CreateNodeResult(
-            ok=True,
-            node_id=node_id,
-            price=price,
-            sku_id=sid,
-            sku_label=label,
+            ok=False,
+            price=last_price,
+            sku_id=last_sid,
+            sku_label=last_label,
             project_id=pid,
-            ip=creds.get("ip"),
-            username=creds.get("username"),
-            password=creds.get("password"),
-            status=int(status_val) if status_val is not None and str(status_val).isdigit() else status_val,
-            payload=payload,
-            create_resp=create_resp,
-            node_info=node_info,
+            payload=last_payload,
+            create_resp=last_create,
+            error="all sku tries failed: " + " | ".join(errors[-8:]),
         )
     except Exception as exc:
         LOG.exception("create_node failed")

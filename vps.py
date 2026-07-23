@@ -295,7 +295,7 @@ def run_pipeline_once(
     register_prefix: str = "bohrium",
     mail_timeout: int = 90,
     require_captcha: bool = False,
-    sku_id: int = DEFAULT_SKU_ID,
+    sku_id: int | None = None,
     image_id: int = DEFAULT_IMAGE_ID,
     disk_size: int = DEFAULT_DISK,
     project_id: int | None = None,
@@ -408,6 +408,8 @@ def run_pipeline_once(
             device=device,
             dry_run=False,
             wait=True,
+            sku_fallback=True,
+            wait_timeout=120.0,
         )
         create_data = create_to_dict(created)
         result["create"] = create_data
@@ -694,7 +696,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mail-timeout", type=int, default=90, help="等验证码超时秒数")
     p.add_argument("--require-captcha", action="store_true", help="强制打码")
 
-    p.add_argument("--sku-id", type=int, default=DEFAULT_SKU_ID)
+    p.add_argument(
+        "--sku-id",
+        type=int,
+        default=None,
+        help="固定机型 skuId；默认不指定，按高配→低配依次尝试",
+    )
     p.add_argument("--image-id", type=int, default=DEFAULT_IMAGE_ID)
     p.add_argument("--disk-size", type=int, default=DEFAULT_DISK)
     p.add_argument("--project-id", type=int, default=None, help="项目ID，默认按账号自动选择")

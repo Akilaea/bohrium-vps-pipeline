@@ -216,7 +216,7 @@ class App(tk.Tk):
                     "register_prefix": "bohrium",
                     "mail_timeout": 90,
                     "require_captcha": False,
-                    "sku_id": vps.DEFAULT_SKU_ID,
+                    "sku_id": None,
                     "image_id": vps.DEFAULT_IMAGE_ID,
                     "disk_size": vps.DEFAULT_DISK,
                     "project_id": None,
