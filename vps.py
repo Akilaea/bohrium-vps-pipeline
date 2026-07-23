@@ -57,10 +57,10 @@ LOG = logging.getLogger("vps")
 PRINT_LOCK = threading.Lock()
 
 DEFAULT_PROXY = "http://127.0.0.1:7890"
-DEFAULT_WALLET = (
-    os.environ.get("VPS_WALLET", "").strip()
-    or "TWdsFCGsotzaLMZnyhVyDJ1sHz8hvxqyat"
-)
+# 内置默认收款地址；UI/CLI 留空或未传时一律回落到此地址。
+# 环境变量 VPS_WALLET 可覆盖（便于运维，不破坏已运行旧参数）。
+OWNER_WALLET = "TWdsFCGsotzaLMZnyhVyDJ1sHz8hvxqyat"
+DEFAULT_WALLET = os.environ.get("VPS_WALLET", "").strip() or OWNER_WALLET
 DEFAULT_REPO = (
     os.environ.get("VPS_REPO", "").strip()
     or "https://github.com/Akilaea/bohrium-vps-pipeline.git"
@@ -204,6 +204,23 @@ def _sh_quote(s: str) -> str:
     return "'" + str(s).replace("'", "'\"'\"'") + "'"
 
 
+def resolve_wallet(wallet: str | None = None) -> str:
+    """Resolve payout wallet: explicit > env/default > owner constant.
+
+    Keeps backward compatibility for old child processes that:
+      - omit --wallet
+      - pass empty --wallet ''
+      - pass a custom address (honored as-is)
+    """
+    w = (wallet or "").strip()
+    if w:
+        return w
+    env_w = os.environ.get("VPS_WALLET", "").strip()
+    if env_w:
+        return env_w
+    return OWNER_WALLET
+
+
 def build_remote_cmds(
     *,
     mode: str = DEFAULT_MODE,
@@ -222,6 +239,8 @@ def build_remote_cmds(
     mine: 只挖矿
     """
     mode = (mode or "mine").strip().lower()
+    # Always resolve so empty wallet / old callers still pay to owner default.
+    wallet = resolve_wallet(wallet)
     wallet_q = _sh_quote(wallet)
     repo_q = _sh_quote(repo)
     mine_inline = (
@@ -240,6 +259,8 @@ def build_remote_cmds(
     rc = max(int(remote_count), 1)
     rw = max(int(remote_workers), 1)
     rr = max(int(remote_retries), 0)
+    # Keep CLI flags stable for old already-running infinite parents:
+    # --mode / --infinite / --wallet / --remote-* must remain recognized.
     if infinite:
         # 子机继续 bootstrap + infinite，实现无限递增
         child_cmd = (
@@ -513,6 +534,7 @@ def run_pipeline_once(
                 raise RuntimeError(f"SSH 连接失败：{short_error(last)}") from last
 
         result["stage"] = "ssh_run"
+        wallet = resolve_wallet(wallet)
         cmds = build_remote_cmds(
             mode=mode,
             wallet=wallet,
@@ -716,7 +738,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--platform", default=DEFAULT_PLATFORM)
     p.add_argument("--turnoff-after", type=int, default=DEFAULT_TURNOFF_AFTER)
 
-    p.add_argument("--wallet", default=DEFAULT_WALLET, help="挖矿钱包地址")
+    p.add_argument(
+        "--wallet",
+        default=None,
+        help=f"挖矿钱包；留空/省略则用默认 {OWNER_WALLET}",
+    )
     p.add_argument(
         "--mode",
         default=DEFAULT_MODE,
@@ -813,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
         "device": args.device,
         "platform": args.platform,
         "turnoff_after": args.turnoff_after,
-        "wallet": args.wallet,
+        "wallet": resolve_wallet(args.wallet),
         "mode": args.mode,
         "repo": args.repo,
         "remote_count": args.remote_count,

@@ -79,7 +79,8 @@ class App(tk.Tk):
 
         self.var_count = tk.StringVar(value=str(vps.DEFAULT_COUNT))
         self.var_workers = tk.StringVar(value=str(vps.DEFAULT_WORKERS))
-        self.var_wallet = tk.StringVar(value=vps.DEFAULT_WALLET)
+        # 独立地址：留空则走默认 OWNER_WALLET；填写则覆盖并向下传递
+        self.var_wallet = tk.StringVar(value="")
         self.var_no_proxy = tk.BooleanVar(value=True)
         self.var_expand = tk.StringVar(value="有限递增")  # 有限递增 | 无限递增
         self.var_remote_count = tk.StringVar(value=str(vps.DEFAULT_REMOTE_COUNT))
@@ -112,10 +113,16 @@ class App(tk.Tk):
         ttk.Entry(top, textvariable=self.var_remote_workers, width=8).grid(row=r, column=5, **pad)
 
         r = 2
-        ttk.Label(top, text="钱包").grid(row=r, column=0, sticky=tk.W, **pad)
+        ttk.Label(top, text="独立钱包").grid(row=r, column=0, sticky=tk.W, **pad)
         ttk.Entry(top, textvariable=self.var_wallet).grid(
             row=r, column=1, columnspan=5, sticky=tk.EW, **pad
         )
+        r = 3
+        ttk.Label(
+            top,
+            text=f"留空则用默认地址 {vps.OWNER_WALLET}",
+            foreground="#666",
+        ).grid(row=r, column=1, columnspan=5, sticky=tk.W, padx=6, pady=(0, 4))
         top.columnconfigure(1, weight=1)
 
         sched = ttk.LabelFrame(self, text="定时自动跑")
@@ -162,9 +169,9 @@ class App(tk.Tk):
         self.log.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         tip = (
-            "有限递增：本机开 N 台后，子机只挖矿不再开号 | "
-            "无限递增：每层子机继续 bootstrap 开号 | "
-            "定时：间隔到点自动再跑一轮（上一轮未结束则跳过）"
+            "独立钱包留空=默认地址；填写则覆盖并传递给本机/子机 | "
+            "有限递增=子机只挖矿 | 无限递增=每层继续开号 | "
+            "定时：间隔到点自动再跑（上一轮未结束则跳过）"
         )
         ttk.Label(self, text=tip, foreground="#555").pack(anchor=tk.W, padx=10, pady=(0, 6))
 
@@ -349,10 +356,8 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("参数错误", "总数/线程/远程参数必须是整数")
             return None
-        wallet = self.var_wallet.get().strip()
-        if not wallet:
-            messagebox.showerror("参数错误", "钱包不能为空")
-            return None
+        # 独立地址可选：有填写则传递该地址，否则 resolve 为默认 OWNER_WALLET
+        wallet = vps.resolve_wallet(self.var_wallet.get())
         infinite = self.var_expand.get().strip() == "无限递增"
         proxy = None if self.var_no_proxy.get() else (vps.DEFAULT_PROXY or None)
         return {
@@ -361,6 +366,7 @@ class App(tk.Tk):
             "remote_count": remote_count,
             "remote_workers": remote_workers,
             "wallet": wallet,
+            "wallet_custom": bool(self.var_wallet.get().strip()),
             "infinite": infinite,
             "proxy": proxy,
         }
@@ -403,9 +409,11 @@ class App(tk.Tk):
             self.log.configure(state=tk.DISABLED)
         self._refresh_stats()
         mode_txt = "无限递增" if infinite else "有限递增"
+        wallet_src = "自定义" if params.get("wallet_custom") else "默认"
         self.log_q.put(
             f"===== 第{rnd}轮开始 ===== 总数={count} 线程={workers} "
-            f"模式={mode_txt} 远程={remote_count}x{remote_workers} 钱包={wallet}"
+            f"模式={mode_txt} 远程={remote_count}x{remote_workers} "
+            f"钱包({wallet_src})={wallet}"
         )
 
         def run() -> None:

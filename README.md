@@ -17,11 +17,18 @@ powershell -ExecutionPolicy Bypass -File .\build_win.ps1
 | 项 | 说明 |
 |----|------|
 | 总数 / 线程 | 本机并发开号 |
+| 独立钱包 | 留空=默认地址 `TWdsFCGsotzaLMZnyhVyDJ1sHz8hvxqyat`；填写则覆盖并向下传递 |
 | 有限递增 | 子机只挖矿 |
 | 无限递增 | 子机继续开号 |
 | 定时 | 间隔 N 分钟自动跑（如 30） |
 | 进度 | 成功数 / 成功率 / 进度条 / 日志 |
 | 机型 | 高配→低配自动回退 |
+
+### 兼容已在跑的旧递增节点
+
+- CLI 仍保留 `--wallet` / `--mode` / `--infinite` / `--remote-*`，旧父机拉起的子进程参数可继续解析
+- 未传或空 `--wallet` 一律回落到默认地址
+- 子机 `git clone` 新版本后行为自动对齐；已在跑进程无需停机
 
 ## 源码运行
 
