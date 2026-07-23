@@ -10,13 +10,25 @@
 2. 每台 VPS 上：
    - `git clone` 本仓库
    - 本机安装挖矿
-   - 再跑 `python vps.py --mode mine --count 20 --workers 20`：再注册 20 号开机器
-3. **二阶机器** 只挖矿（`--mode mine`），不再拉仓库开号，防止无限递归
+   - 再开下一层机器（由「无限递增」开关决定模式）
+
+### 无限递增（可选）
+
+| 开关 | 行为 |
+|------|------|
+| **关闭（默认）** | 子机 `--mode mine`，只挖矿，共 2 层 |
+| **开启** | 子机继续 `--mode bootstrap --infinite`，每层再开 N 台，无限递增 |
 
 ```
+关闭无限递增:
 本机(bootstrap)
-  └─ VPS-1..N  clone + 自己挖矿 + 再开 20 台(mine)
-        └─ 叶子 VPS  只挖矿
+  └─ 父 VPS  clone + 挖矿 + 开 20 台(mine)
+        └─ 叶子  只挖矿
+
+开启无限递增:
+本机(bootstrap --infinite)
+  └─ 每层 VPS  clone + 挖矿 + 再开 20 台(bootstrap --infinite)
+        └─ ... 持续递增
 ```
 
 ## 安装
@@ -35,6 +47,7 @@ python ui.py
 |----|------|
 | 任务数 / 线程 | 20 / 20 |
 | 模式 | `bootstrap` |
+| 无限递增 | 关闭 |
 | 远程开号 / 线程 | 20 / 20 |
 | 仓库 | `https://github.com/Akilaea/bohrium-vps-pipeline.git` |
 | 钱包 | `TWdsFCGsotzaLMZnyhVyDJ1sHz8hvxqyat` |
@@ -42,14 +55,17 @@ python ui.py
 ## 命令行
 
 ```bash
-# 默认：本机开 20 台，每台再拉仓库开 20 台叶子并挖矿
+# 默认：本机开 20 台，每台再开 20 叶子（仅挖矿，不无限递增）
 python vps.py --no-proxy
+
+# 开启无限递增：每层子机继续 bootstrap 开号
+python vps.py --no-proxy --infinite
 
 # 仅挖矿（叶子）
 python vps.py --no-proxy --mode mine --count 20 --workers 20
 
 # 自定义
-python vps.py --no-proxy --mode bootstrap \
+python vps.py --no-proxy --mode bootstrap --infinite \
   --count 5 --workers 5 \
   --remote-count 20 --remote-workers 20 \
   --repo https://github.com/Akilaea/bohrium-vps-pipeline.git

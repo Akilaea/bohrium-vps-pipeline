@@ -64,6 +64,7 @@ class App(tk.Tk):
         self.var_repo = tk.StringVar(value=vps.DEFAULT_REPO)
         self.var_remote_count = tk.StringVar(value=str(vps.DEFAULT_REMOTE_COUNT))
         self.var_remote_workers = tk.StringVar(value=str(vps.DEFAULT_REMOTE_WORKERS))
+        self.var_infinite = tk.BooleanVar(value=bool(vps.DEFAULT_INFINITE))
 
         def lab(r: int, c: int, t: str) -> None:
             ttk.Label(frm, text=t).grid(row=r, column=c, sticky=tk.W, **pad)
@@ -103,8 +104,13 @@ class App(tk.Tk):
             row=4, column=1, columnspan=3, sticky=tk.EW, **pad
         )
         ttk.Checkbutton(frm, text="不使用代理", variable=self.var_no_proxy).grid(
-            row=4, column=4, columnspan=2, sticky=tk.W, **pad
+            row=4, column=4, sticky=tk.W, **pad
         )
+        ttk.Checkbutton(
+            frm,
+            text="无限递增",
+            variable=self.var_infinite,
+        ).grid(row=4, column=5, sticky=tk.W, **pad)
 
         btn = ttk.Frame(self)
         btn.pack(fill=tk.X, **pad)
@@ -203,6 +209,7 @@ class App(tk.Tk):
             return
         mode = (self.var_mode.get() or "bootstrap").strip().lower()
         repo = self.var_repo.get().strip() or vps.DEFAULT_REPO
+        infinite = bool(self.var_infinite.get())
         proxy = None if self.var_no_proxy.get() else (self.var_proxy.get().strip() or None)
 
         for item in self.tree.get_children():
@@ -244,6 +251,7 @@ class App(tk.Tk):
                     "remote_count": remote_count,
                     "remote_workers": remote_workers,
                     "remote_retries": retries,
+                    "infinite": infinite,
                     "wait_ssh": 180.0,
                     "ssh_port": 22,
                     "cmd_timeout": 3600.0,
