@@ -215,6 +215,47 @@ def pick_default_project(client: BohriumNodeClient, project_id: int | None = Non
     return items[0]
 
 
+def _balance_value(bal_resp: dict[str, Any]) -> float:
+    data = bal_resp.get("data") or {}
+    if not isinstance(data, dict):
+        return 0.0
+    for key in ("balance", "orgBalance", "available"):
+        try:
+            return float(data.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def wait_account_ready(
+    client: BohriumNodeClient,
+    *,
+    project_id: int | None = None,
+    min_balance: float = 1.0,
+    timeout: float = 90.0,
+    interval: float = 3.0,
+) -> dict[str, Any]:
+    """Wait until default project exists and free-credit balance is ready."""
+    deadline = time.time() + max(timeout, 0.0)
+    last_err = "account not ready"
+    while time.time() < deadline:
+        try:
+            bal = client.balance()
+            value = _balance_value(bal)
+            LOG.info("balance poll: %s (value=%s)", bal.get("data"), value)
+            if value < min_balance:
+                last_err = f"balance too low: {value}"
+                time.sleep(interval)
+                continue
+            project = pick_default_project(client, project_id=project_id)
+            return project
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)
+            LOG.warning("account not ready yet: %s", last_err)
+            time.sleep(interval)
+    raise RuntimeError(f"account not ready within {int(timeout)}s: {last_err}")
+
+
 def list_skus(client: BohriumNodeClient) -> list[dict[str, Any]]:
     data = client.resources()
     if int(data.get("code", -1)) != 0:
@@ -417,7 +458,8 @@ def create_node(
         bal = client.balance()
         LOG.info("balance: %s", bal.get("data"))
 
-        project = pick_default_project(client, project_id=project_id)
+        # New accounts often need a few seconds before project/credits appear.
+        project = wait_account_ready(client, project_id=project_id, min_balance=1.0, timeout=90.0)
         pid = int(project.get("id") or project.get("projectId"))
         LOG.info("project id=%s name=%s", pid, project.get("name"))
 
@@ -497,8 +539,29 @@ def create_node(
                 error=None,
             )
 
-        create_resp = client.node_add(payload)
-        LOG.info("create resp: %s", create_resp)
+        create_resp: dict[str, Any] | None = None
+        for attempt in range(1, 6):
+            create_resp = client.node_add(payload)
+            LOG.info("create resp attempt=%s: %s", attempt, create_resp)
+            code = int(create_resp.get("code", -1))
+            if code == 0:
+                break
+            msg = str(((create_resp.get("error") or {}).get("msg") or create_resp))
+            # Transient: free credits / project init race right after register
+            if code in {148888, 140404} or "balance" in msg.lower() or "project" in msg.lower():
+                LOG.warning("node/add transient fail code=%s msg=%s; retry %s/5", code, msg, attempt)
+                time.sleep(3.0 * attempt)
+                try:
+                    project = wait_account_ready(
+                        client, project_id=project_id, min_balance=1.0, timeout=30.0, interval=2.0
+                    )
+                    pid = int(project.get("id") or project.get("projectId") or pid)
+                    payload["projectId"] = pid
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("re-wait account ready failed: %s", exc)
+                continue
+            break
+        assert create_resp is not None
         if int(create_resp.get("code", -1)) != 0:
             return CreateNodeResult(
                 ok=False,
