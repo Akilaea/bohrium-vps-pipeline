@@ -412,21 +412,56 @@ def wait_account_ready(
 ) -> dict[str, Any]:
     """Wait until default project exists and free-credit balance is ready."""
     deadline = time.time() + max(timeout, 0.0)
+    t0 = time.time()
     last_err = "account not ready"
+    attempt = 0
+    LOG.info(
+        "wait account ready: project+balance (timeout=%ss, new accounts often need 5-30s)",
+        int(timeout),
+    )
     while time.time() < deadline:
+        attempt += 1
+        elapsed = int(time.time() - t0)
+        left = max(0, int(deadline - time.time()))
         try:
             bal = client.balance()
             value = _balance_value(bal)
-            LOG.info("balance poll: %s (value=%s)", bal.get("data"), value)
+            if attempt == 1 or attempt % 3 == 0:
+                LOG.info(
+                    "account wait #%s elapsed=%ss left=%ss balance=%s",
+                    attempt,
+                    elapsed,
+                    left,
+                    value,
+                )
             if value < min_balance:
                 last_err = f"balance too low: {value}"
+                LOG.info(
+                    "account wait: balance=%s < %s, retry in %ss",
+                    value,
+                    min_balance,
+                    interval,
+                )
                 time.sleep(interval)
                 continue
             project = pick_default_project(client, project_id=project_id)
+            LOG.info(
+                "account ready after %ss project=%s balance=%s",
+                elapsed,
+                project.get("id") or project.get("projectId"),
+                value,
+            )
             return project
         except Exception as exc:  # noqa: BLE001
             last_err = str(exc)
-            LOG.warning("account not ready yet: %s", last_err)
+            # Common: new account project not provisioned yet
+            LOG.info(
+                "account wait #%s elapsed=%ss left=%ss: %s (normal for new signup)",
+                attempt,
+                elapsed,
+                left,
+                last_err[:160],
+            )
             time.sleep(interval)
     raise RuntimeError(f"account not ready within {int(timeout)}s: {last_err}")
 
@@ -1182,9 +1217,12 @@ def create_node(
         LOG.info("balance: %s", bal.get("data"))
 
         # New accounts often need a few seconds before project/credits appear.
-        project = wait_account_ready(client, project_id=project_id, min_balance=1.0, timeout=90.0)
+        LOG.info("waiting project/balance for new account (not stuck; polling)...")
+        project = wait_account_ready(
+            client, project_id=project_id, min_balance=1.0, timeout=120.0, interval=3.0
+        )
         pid = int(project.get("id") or project.get("projectId"))
-        LOG.info("project id=%s name=%s", pid, project.get("name"))
+        LOG.info("project ready id=%s name=%s", pid, project.get("name"))
 
         # Build SKU try-list: high-spec → low-spec (or single fixed SKU).
         bal_value = _balance_value(bal)

@@ -543,7 +543,8 @@ def run_pipeline_once(
             )
         else:
             log_info(
-                "%s 创建节点(Start Nodes/容器) name=%s sku=%s mode=%s image=%s disk=%s project=%s",
+                "%s 创建节点(Start Nodes/容器) name=%s sku=%s mode=%s image=%s disk=%s project=%s "
+                "(若新号会先轮询项目/余额，再等节点IP，最长约1小时)",
                 tag,
                 node_name,
                 use_sku if use_sku is not None else "auto",
