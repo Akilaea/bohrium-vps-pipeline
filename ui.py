@@ -83,7 +83,7 @@ class App(tk.Tk):
         self.var_wallet = tk.StringVar(value="")
         self.var_no_proxy = tk.BooleanVar(value=True)
         self.var_expand = tk.StringVar(value="有限递增")  # 有限递增 | 无限递增
-        self.var_device = tk.StringVar(value="容器")  # 容器 | 虚拟机 → container | vm
+        self.var_product = tk.StringVar(value="Start Nodes")  # Start Nodes | Run Notebooks
         self.var_remote_count = tk.StringVar(value=str(vps.DEFAULT_REMOTE_COUNT))
         self.var_remote_workers = tk.StringVar(value=str(vps.DEFAULT_REMOTE_WORKERS))
         self.var_schedule = tk.BooleanVar(value=False)
@@ -108,12 +108,12 @@ class App(tk.Tk):
             width=12,
             state="readonly",
         ).grid(row=r, column=1, sticky=tk.W, **pad)
-        ttk.Label(top, text="运行形态").grid(row=r, column=2, sticky=tk.W, **pad)
+        ttk.Label(top, text="产品模式").grid(row=r, column=2, sticky=tk.W, **pad)
         ttk.Combobox(
             top,
-            textvariable=self.var_device,
-            values=["容器", "虚拟机"],
-            width=10,
+            textvariable=self.var_product,
+            values=["Start Nodes", "Run Notebooks"],
+            width=14,
             state="readonly",
         ).grid(row=r, column=3, sticky=tk.W, **pad)
         ttk.Label(top, text="远程开号").grid(row=r, column=4, sticky=tk.W, **pad)
@@ -129,7 +129,7 @@ class App(tk.Tk):
         r = 3
         ttk.Label(
             top,
-            text=f"默认容器(container)；留空钱包= {vps.OWNER_WALLET}",
+            text=f"默认 Start Nodes 容器；Notebook 为第二模式；钱包留空= {vps.OWNER_WALLET}",
             foreground="#666",
         ).grid(row=r, column=1, columnspan=5, sticky=tk.W, padx=6, pady=(0, 4))
         top.columnconfigure(3, weight=1)
@@ -178,7 +178,7 @@ class App(tk.Tk):
         self.log.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         tip = (
-            "默认容器(container)，可选虚拟机(vm) | "
+            "产品：Start Nodes 容器（默认）/ Run Notebooks（第二模式） | "
             "独立钱包留空=默认地址 | 有限递增=子机只挖矿 | 无限递增=每层继续开号 | "
             "定时：间隔到点自动再跑（上一轮未结束则跳过）"
         )
@@ -200,17 +200,17 @@ class App(tk.Tk):
             "remote_workers": self.var_remote_workers,
             "interval_min": self.var_interval_min,
             "expand": self.var_expand,
-            "device": self.var_device,
+            "product": self.var_product,
         }
         for k, var in mapping.items():
             if k in data and data[k] is not None:
                 val = str(data[k])
-                # compat: store either 中文 or raw container/vm
-                if k == "device":
-                    if val in ("vm", "虚拟机"):
-                        val = "虚拟机"
+                if k == "product":
+                    if val in ("notebook", "Run Notebooks", "Notebook", "notebooks"):
+                        val = "Run Notebooks"
                     else:
-                        val = "容器"
+                        val = "Start Nodes"
+                # legacy device field ignored
                 var.set(val)
         if "no_proxy" in data:
             self.var_no_proxy.set(bool(data["no_proxy"]))
@@ -228,7 +228,7 @@ class App(tk.Tk):
             "wallet": self.var_wallet.get(),
             "no_proxy": bool(self.var_no_proxy.get()),
             "expand": self.var_expand.get(),
-            "device": self.var_device.get(),
+            "product": self.var_product.get(),
             "remote_count": self.var_remote_count.get(),
             "remote_workers": self.var_remote_workers.get(),
             "schedule": bool(self.var_schedule.get()),
@@ -377,8 +377,11 @@ class App(tk.Tk):
         # 独立地址可选：有填写则传递该地址，否则 resolve 为默认 OWNER_WALLET
         wallet = vps.resolve_wallet(self.var_wallet.get())
         infinite = self.var_expand.get().strip() == "无限递增"
-        # 默认容器；UI 可选虚拟机
-        device = "vm" if self.var_device.get().strip() == "虚拟机" else "container"
+        product = (
+            "notebook"
+            if self.var_product.get().strip() in {"Run Notebooks", "notebook", "Notebook"}
+            else "node"
+        )
         proxy = None if self.var_no_proxy.get() else (vps.DEFAULT_PROXY or None)
         return {
             "count": count,
@@ -388,7 +391,7 @@ class App(tk.Tk):
             "wallet": wallet,
             "wallet_custom": bool(self.var_wallet.get().strip()),
             "infinite": infinite,
-            "device": device,
+            "product": product,
             "proxy": proxy,
         }
 
@@ -407,7 +410,7 @@ class App(tk.Tk):
         infinite = params["infinite"]
         wallet = params["wallet"]
         proxy = params["proxy"]
-        device = params["device"]
+        product = params["product"]
         remote_count = params["remote_count"]
         remote_workers = params["remote_workers"]
 
@@ -431,11 +434,11 @@ class App(tk.Tk):
             self.log.configure(state=tk.DISABLED)
         self._refresh_stats()
         mode_txt = "无限递增" if infinite else "有限递增"
-        device_txt = "虚拟机" if device == "vm" else "容器"
+        product_txt = "Run Notebooks" if product == "notebook" else "Start Nodes"
         wallet_src = "自定义" if params.get("wallet_custom") else "默认"
         self.log_q.put(
             f"===== 第{rnd}轮开始 ===== 总数={count} 线程={workers} "
-            f"模式={mode_txt} 形态={device_txt}({device}) "
+            f"模式={mode_txt} 产品={product_txt} "
             f"远程={remote_count}x{remote_workers} "
             f"钱包({wallet_src})={wallet}"
         )
@@ -463,7 +466,8 @@ class App(tk.Tk):
                     "disk_size": vps.DEFAULT_DISK,
                     "project_id": None,
                     "name": None,
-                    "device": device,
+                    "device": "container",
+                    "product": product,
                     "platform": vps.DEFAULT_PLATFORM,
                     "turnoff_after": vps.DEFAULT_TURNOFF_AFTER,
                     "wallet": wallet,

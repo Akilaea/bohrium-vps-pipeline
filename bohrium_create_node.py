@@ -61,10 +61,9 @@ DEFAULT_SKU_ID = 419
 DEFAULT_SKU_LABEL = "sku-419"
 DEFAULT_DISK = 20
 DEFAULT_IMAGE_ID = 37611
-# container = 容器（默认，轻量）；vm = 虚拟机
+# Start Nodes only uses container (VM option removed as unsupported shell)
 DEFAULT_DEVICE = "container"
 DEVICE_CONTAINER = "container"
-DEVICE_VM = "vm"
 DEFAULT_PLATFORM = "ali"
 DEFAULT_TURNOFF_AFTER = -1
 DEFAULT_PROJECT_ID = None  # each account has its own default project
@@ -1112,10 +1111,7 @@ def _sku_fail_is_capacity(msg: str, code: int) -> bool:
 
 
 def normalize_device(device: str | None) -> str:
-    """Map UI/CLI labels to API device string. Default: container."""
-    d = (device or DEFAULT_DEVICE).strip().lower()
-    if d in {"vm", "virtual", "virtualmachine", "虚拟机", "kvm"}:
-        return DEVICE_VM
+    """Always container for Start Nodes (vm removed)."""
     return DEVICE_CONTAINER
 
 
@@ -1515,8 +1511,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--device",
         default=DEFAULT_DEVICE,
-        choices=[DEVICE_CONTAINER, DEVICE_VM, "container", "vm"],
-        help='运行形态：container=容器（默认），vm=虚拟机',
+        help="Start Nodes 设备：固定 container",
     )
     p.add_argument("--dry-run", action="store_true", help="only resolve sku/image/payload, do not create")
     p.add_argument("--no-wait", action="store_true", help="do not poll node list after create")

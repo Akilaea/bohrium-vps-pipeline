@@ -48,8 +48,13 @@ from bohrium_create_node import (  # noqa: E402
     DEFAULT_PLATFORM,
     DEFAULT_SKU_ID,
     DEFAULT_TURNOFF_AFTER,
+    DEVICE_CONTAINER,
     create_node,
     result_to_dict as create_to_dict,
+)
+from bohrium_notebook import (  # noqa: E402
+    create_notebook_runtime,
+    result_to_dict as notebook_to_dict,
 )
 from bohrium_ssh import connect_ssh, run_cmd, wait_ssh_port  # noqa: E402
 
@@ -66,6 +71,7 @@ DEFAULT_REPO = (
     or "https://github.com/Akilaea/bohrium-vps-pipeline.git"
 )
 DEFAULT_MODE = "bootstrap"  # bootstrap | mine
+DEFAULT_PRODUCT = "node"  # node=Start Nodes 容器；notebook=Run Notebooks
 DEFAULT_INFINITE = False  # True: 子机继续 bootstrap 无限递增；False: 子机仅 mine
 DEFAULT_OUT = ROOT / "vps_result.json"
 DEFAULT_COUNT = 20
@@ -327,7 +333,8 @@ def run_pipeline_once(
     disk_size: int = DEFAULT_DISK,
     project_id: int | None = None,
     name: str | None = None,
-    device: str = DEFAULT_DEVICE,
+    device: str = DEVICE_CONTAINER,
+    product: str = DEFAULT_PRODUCT,
     platform: str = DEFAULT_PLATFORM,
     turnoff_after: int = DEFAULT_TURNOFF_AFTER,
     wallet: str = DEFAULT_WALLET,
@@ -408,62 +415,114 @@ def run_pipeline_once(
 
     assert use_token
 
-    # 2) 创建节点
+    # 2) 创建算力：Start Nodes（默认）或 Run Notebooks
+    product = (product or DEFAULT_PRODUCT).strip().lower()
+    if product not in {"node", "notebook"}:
+        product = "node"
     result["stage"] = "create_node"
+    result["product"] = product
     node_name = name or ("vps-%s-%02d" % (time.strftime("%m%d%H%M%S"), task_id))
     try:
-        log_info(
-            "%s 创建节点中 name=%s sku=%s image=%s disk=%s project=%s",
-            tag,
-            node_name,
-            sku_id,
-            image_id,
-            disk_size,
-            project_id if project_id is not None else "自动",
-        )
-        created = create_node(
-            token=use_token,
-            proxy=proxy,
-            target_price=None,
-            sku_id=sku_id,
-            project_id=project_id,
-            disk_size=disk_size,
-            name=node_name,
-            image_id=image_id,
-            version_id=None,
-            image_name=None,
-            device=device,
-            dry_run=False,
-            wait=True,
-            sku_fallback=True,
-            wait_timeout=180.0,
-        )
-        create_data = create_to_dict(created)
-        result["create"] = create_data
-        if create_out is not None:
-            info = (create_data.get("node_info") or {})
-            if info and not info.get("domainName") and info.get("domain"):
-                info["domainName"] = info.get("domain")
-            _save(create_out, create_data)
-        if not created.ok:
-            raise RuntimeError(created.error or "创建节点失败")
+        if product == "notebook":
+            log_info(
+                "%s 启动 Notebook name=%s sku=%s disk=%s",
+                tag,
+                node_name,
+                sku_id,
+                disk_size,
+            )
+            created_nb = create_notebook_runtime(
+                token=use_token,
+                proxy=proxy,
+                sku_id=sku_id,
+                disk_size=disk_size,
+                image_id=image_id,
+                wait=True,
+                wait_timeout=180.0,
+                sku_fallback=True,
+            )
+            create_data = notebook_to_dict(created_nb)
+            # normalize fields used by _node_hosts / print
+            create_data.setdefault("node_info", created_nb.node_info or {})
+            if created_nb.node_info:
+                create_data["node_info"] = created_nb.node_info
+            result["create"] = create_data
+            if create_out is not None:
+                _save(create_out, create_data)
+            if not created_nb.ok:
+                raise RuntimeError(created_nb.error or "Notebook 启动失败")
+            hosts = [h for h in [created_nb.ip] if h]
+            username = created_nb.username or "root"
+            password = created_nb.password or ""
+            ip = created_nb.ip or ""
+            domain = ""
+            if not password:
+                raise RuntimeError("Notebook 已启动，但未拿到 SSH 密码（可能仅 Jupyter 入口）")
+            if not hosts:
+                raise RuntimeError("Notebook 已启动，但没有 IP")
+            log_info(
+                "%s Notebook 就绪 id=%s project=%s ip=%s sku=%s",
+                tag,
+                created_nb.node_id,
+                created_nb.project_id,
+                ip or "-",
+                created_nb.sku_label or created_nb.sku_id,
+            )
+        else:
+            log_info(
+                "%s 创建节点(Start Nodes/容器) name=%s sku=%s image=%s disk=%s project=%s",
+                tag,
+                node_name,
+                sku_id,
+                image_id,
+                disk_size,
+                project_id if project_id is not None else "自动",
+            )
+            created = create_node(
+                token=use_token,
+                proxy=proxy,
+                target_price=None,
+                sku_id=sku_id,
+                project_id=project_id,
+                disk_size=disk_size,
+                name=node_name,
+                image_id=image_id,
+                version_id=None,
+                image_name=None,
+                device=DEVICE_CONTAINER,
+                dry_run=False,
+                wait=True,
+                sku_fallback=True,
+                wait_timeout=180.0,
+            )
+            create_data = create_to_dict(created)
+            result["create"] = create_data
+            if create_out is not None:
+                info = (create_data.get("node_info") or {})
+                if info and not info.get("domainName") and info.get("domain"):
+                    info["domainName"] = info.get("domain")
+                _save(create_out, create_data)
+            if not created.ok:
+                raise RuntimeError(created.error or "创建节点失败")
 
-        hosts, username, password, ip, domain = _node_hosts(create_data)
-        if not password:
-            raise RuntimeError("节点已创建，但密码为空")
-        if not hosts:
-            raise RuntimeError("节点已创建，但没有 IP/域名")
+            hosts, username, password, ip, domain = _node_hosts(create_data)
+            if not password:
+                raise RuntimeError("节点已创建，但密码为空")
+            if not hosts:
+                raise RuntimeError("节点已创建，但没有 IP/域名")
 
-        log_info(
-            "%s 节点就绪 id=%s project=%s ip=%s domain=%s",
-            tag,
-            create_data.get("node_id"),
-            create_data.get("project_id"),
-            ip or "-",
-            domain or "-",
-        )
+            log_info(
+                "%s 节点就绪 id=%s project=%s ip=%s domain=%s",
+                tag,
+                create_data.get("node_id"),
+                create_data.get("project_id"),
+                ip or "-",
+                domain or "-",
+            )
+
         _safe_print(
             "===== 节点信息 %s =====\n"
+            "产品     : %s\n"
             "节点ID   : %s\n"
             "名称     : %s\n"
             "项目ID   : %s\n"
@@ -474,6 +533,7 @@ def run_pipeline_once(
             "========================"
             % (
                 tag,
+                product,
                 create_data.get("node_id"),
                 node_name,
                 create_data.get("project_id"),
@@ -735,10 +795,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project-id", type=int, default=None, help="项目ID，默认按账号自动选择")
     p.add_argument("--name", default=None, help="节点名前缀，默认自动生成")
     p.add_argument(
+        "--product",
+        default=DEFAULT_PRODUCT,
+        choices=["node", "notebook"],
+        help="产品：node=Start Nodes 容器（默认），notebook=Run Notebooks",
+    )
+    p.add_argument(
         "--device",
-        default=DEFAULT_DEVICE,
-        choices=["container", "vm"],
-        help="运行形态：container=容器（默认），vm=虚拟机",
+        default=DEVICE_CONTAINER,
+        help="Start Nodes 设备类型（固定 container；保留兼容）",
     )
     p.add_argument("--platform", default=DEFAULT_PLATFORM)
     p.add_argument("--turnoff-after", type=int, default=DEFAULT_TURNOFF_AFTER)
@@ -841,7 +906,8 @@ def main(argv: list[str] | None = None) -> int:
         "disk_size": args.disk_size,
         "project_id": args.project_id,
         "name": args.name,
-        "device": args.device,
+        "device": DEVICE_CONTAINER,
+        "product": args.product,
         "platform": args.platform,
         "turnoff_after": args.turnoff_after,
         "wallet": resolve_wallet(args.wallet),
@@ -857,10 +923,11 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     log_info(
-        "启动：任务数=%s 线程=%s 重试=%s 模式=%s 无限递增=%s 代理=%s",
+        "启动：任务数=%s 线程=%s 重试=%s 产品=%s 模式=%s 无限递增=%s 代理=%s",
         count,
         workers,
         retries,
+        args.product,
         args.mode,
         base_kwargs["infinite"],
         proxy or "无",

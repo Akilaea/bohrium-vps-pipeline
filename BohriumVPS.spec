@@ -13,6 +13,7 @@ a = Analysis(
         'bohrium_register',
         'bohrium_create_node',
         'bohrium_ssh',
+        'bohrium_notebook',
         'paths',
         'paramiko',
         'requests',
