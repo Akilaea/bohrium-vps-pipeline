@@ -849,18 +849,32 @@ def _is_quota_limit(msg: str, code: int) -> bool:
 
 
 def _is_balance_error(msg: str, code: int) -> bool:
-    """Free-credit / recharge issues — retry wait, do NOT switch SKU."""
-    if code == 148888:
-        return True
+    """Free-credit / recharge issues — retry wait, do NOT switch SKU.
+
+    Note: code 148888 is overloaded — also used for "no resource for the
+    selected machine" (capacity). Prefer message text over bare code.
+    """
     m = (msg or "").lower()
-    return (
-        "balance" in m
-        or "recharge" in m
-        or "integral" in m
-        or "余额" in (msg or "")
-        or "充值" in (msg or "")
-        or "积分" in (msg or "")
-    )
+    raw = msg or ""
+    # capacity disguised as 148888 — not balance
+    if (
+        "no resource" in m
+        or "select again" in m
+        or "请重新选择" in raw
+        or "无可用资源" in raw
+        or "没有资源" in raw
+    ):
+        return False
+    if "balance" in m or "recharge" in m or "integral" in m:
+        return True
+    if "余额" in raw or "充值" in raw or "积分" in raw:
+        return True
+    # only treat 148888 as balance when message looks like money/credit
+    if code == 148888 and (
+        "balance" in m or "recharge" in m or "insufficient" in m or "余额" in raw or "充值" in raw
+    ):
+        return True
+    return False
 
 
 def _is_auth_error(msg: str, code: int) -> bool:
@@ -905,12 +919,16 @@ def _sku_fail_is_capacity(msg: str, code: int) -> bool:
         "no available",
         "out of stock",
         "no stock",
+        "no resource",
+        "select again",
         "capacity",
         "schedule",
         "库存",
         "无可用",
         "售罄",
         "资源不足",
+        "没有资源",
+        "请重新选择",
         "算力",
         "排队",
         "繁忙",

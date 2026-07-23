@@ -42,8 +42,13 @@ if str(SLIDE_DIR) not in sys.path:
     sys.path.insert(0, str(SLIDE_DIR))
 
 PLATFORM = "https://platform.bohrium.com"
+WWW = "https://www.bohrium.com"
 API = f"{PLATFORM}/api"
+WWW_API = f"{WWW}/bohrapi/v1"
 LOGIN_PAGE = f"{PLATFORM}/login"
+# 发码走 www 域名 bohrapi（platform 的 send_by_email 易被 WAF 405）
+SEND_CODE_URL = f"{WWW_API}/account/code/send_by_email"
+LOGIN_EMAIL_URL = f"{API}/account/login/email_code"
 
 MAIL_API_URL = "https://mail.minecraft-cn.net"
 MAIL_DOMAIN = "olsbvgq.shop"
@@ -211,7 +216,8 @@ class BohriumClient:
             try:
                 is_oversea = self.is_oversea()
             except Exception:
-                is_oversea = False
+                # 海外出口常见；发码接口对 isOversea 不敏感时默认 True 更稳
+                is_oversea = True
         payload: dict[str, Any] = {
             "email": email,
             "sceneType": int(scene_type),
@@ -219,19 +225,36 @@ class BohriumClient:
             "refer": refer,
             "isOversea": bool(is_oversea),
         }
-        # Frontend currently does not attach captcha to email send, but keep fields
-        # ready in case backend starts enforcing Tencent ticket validation.
         if captcha is not None:
             payload["ticket"] = captcha.ticket
             payload["randstr"] = captcha.randstr
         if extra:
             payload.update(extra)
-        LOG.info("send email code -> %s sceneType=%s isOversea=%s", email, scene_type, is_oversea)
+        LOG.info(
+            "send email code -> %s sceneType=%s isOversea=%s via bohrapi",
+            email,
+            scene_type,
+            is_oversea,
+        )
+        # 发码改走 www.bohrium.com/bohrapi（绕开 platform 的 405 WAF）
+        headers = {
+            "Origin": WWW,
+            "Referer": f"{WWW}/en/nodes",
+        }
         resp = self.session.post(
-            f"{API}/account/code/send_by_email",
+            SEND_CODE_URL,
             json=payload,
+            headers=headers,
             timeout=self.timeout,
         )
+        if resp.status_code == 405:
+            # 兜底：旧 platform 路径（一般仍 405，但兼容环境差异）
+            LOG.warning("bohrapi send_by_email HTTP 405, fallback platform path")
+            resp = self.session.post(
+                f"{API}/account/code/send_by_email",
+                json=payload,
+                timeout=self.timeout,
+            )
         resp.raise_for_status()
         data = resp.json()
         LOG.info("send email code response: %s", json.dumps(data, ensure_ascii=False)[:400])
@@ -249,30 +272,73 @@ class BohriumClient:
         captcha: CaptchaTicket | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # platform login/email_code：主字段 PascalCase（实测有效）
         payload: dict[str, Any] = {
-            "email": email,
-            "code": code,
-            "businessLine": BUSINESS_LINE,
-            "refer": refer if refer is not None else {},
+            "Email": email,
+            "Code": str(code),
+            "BusinessLine": BUSINESS_LINE,
             "channel": channel,
-            "device": device,  # backend expects string, not object
-            "ext": ext,
+            "device": device,
         }
+        if refer is not None:
+            payload["refer"] = refer
+        if ext:
+            payload["ext"] = ext
         if captcha is not None:
             payload["ticket"] = captcha.ticket
             payload["randstr"] = captcha.randstr
         if extra:
             payload.update(extra)
         LOG.info("login/register email_code -> %s", email)
-        resp = self.session.post(
-            f"{API}/account/login/email_code",
-            json=payload,
-            timeout=self.timeout,
-        )
+        # 强制 platform Origin，避免发码阶段的 www 头污染会话判断
+        headers = {
+            "Origin": PLATFORM,
+            "Referer": LOGIN_PAGE,
+        }
+        last_err: Exception | None = None
+        data: dict[str, Any] = {}
+        for attempt in range(1, 4):
+            resp = self.session.post(
+                LOGIN_EMAIL_URL,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+            )
+            if resp.status_code == 405:
+                LOG.warning("login email_code HTTP 405 (attempt %s/3), backoff", attempt)
+                time.sleep(2.0 * attempt)
+                last_err = RuntimeError("login email_code HTTP 405")
+                # 405 时尝试 camelCase 兜底一轮
+                if attempt == 2:
+                    camel = {
+                        "email": email,
+                        "code": str(code),
+                        "businessLine": BUSINESS_LINE,
+                        "channel": channel,
+                        "device": device,
+                    }
+                    resp = self.session.post(
+                        LOGIN_EMAIL_URL,
+                        json=camel,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
+                    if resp.status_code != 405:
+                        break
+                continue
+            break
+        else:
+            if last_err:
+                raise last_err
+        if resp.status_code >= 400:
+            LOG.error("login HTTP %s body=%s", resp.status_code, (resp.text or "")[:300])
         resp.raise_for_status()
         data = resp.json()
-        # token may be set as cookie brmToken / sso-brmToken
-        LOG.info("login response code=%s keys=%s", data.get("code"), list((data.get("data") or {}).keys()))
+        LOG.info(
+            "login response code=%s keys=%s",
+            data.get("code"),
+            list((data.get("data") or {}).keys()) if isinstance(data.get("data"), dict) else type(data.get("data")),
+        )
         return data
 
     def auth_check(self, token: str | None = None) -> dict[str, Any]:
