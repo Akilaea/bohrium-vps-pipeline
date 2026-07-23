@@ -491,11 +491,12 @@ def solve_slide_captcha(
     aid: int = TENCENT_CAPTCHA_AID,
     retries: int = 3,
     seed: int | None = None,
+    aid_encrypted: str | None = None,
 ) -> CaptchaTicket:
-    """Solve Tencent captcha: try slide / image(点图) / text(点字) in order.
+    """Solve Tencent captcha: try image(点图) / slide / text(点字) in order.
 
     Bohrium only toggles TencentCaptcha on/off; the concrete challenge type is
-    chosen by Tencent risk control (not fixed to slide).
+    chosen by Tencent risk control (browser showed subcapclass=2408 image).
     """
     try:
         from captcha_multi import solve_tencent_captcha
@@ -504,12 +505,19 @@ def solve_slide_captcha(
 
     if solve_tencent_captcha is not None:
         LOG.info(
-            "solving tencent captcha (slide|image|text) aid=%s proxy=%s retries=%s",
+            "solving tencent captcha (image|slide|text) aid=%s proxy=%s retries=%s enc=%s",
             aid,
             proxy,
             retries,
+            bool(aid_encrypted),
         )
-        t = solve_tencent_captcha(proxy, aid=aid, retries=retries, seed=seed)
+        t = solve_tencent_captcha(
+            proxy,
+            aid=aid,
+            retries=retries,
+            seed=seed,
+            aid_encrypted=aid_encrypted,
+        )
         LOG.info("captcha solved kind=%s ticket_len=%s randstr=%s", t.kind, len(t.ticket), t.randstr)
         return CaptchaTicket(ticket=t.ticket, randstr=t.randstr, raw=t.raw or {"kind": t.kind})
 
@@ -591,6 +599,7 @@ def register_once(
                     aid=TENCENT_CAPTCHA_AID,
                     retries=captcha_retries,
                     seed=captcha_seed,
+                    aid_encrypted=aid_encrypted,
                 )
             except Exception as exc:
                 if require_captcha:

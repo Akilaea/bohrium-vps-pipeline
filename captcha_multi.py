@@ -53,12 +53,19 @@ def _ticket_from_result(result: dict[str, Any], kind: str) -> CaptchaTicket:
     return CaptchaTicket(ticket=ticket, randstr=randstr, kind=kind, raw=result)
 
 
-def _solve_slide(proxy: str | None, *, aid: int, retries: int, seed: int | None) -> CaptchaTicket:
+def _solve_slide(
+    proxy: str | None,
+    *,
+    aid: int,
+    retries: int,
+    seed: int | None,
+    aid_encrypted: str | None = None,
+) -> CaptchaTicket:
     _ensure_path(BYPASS / "slide")
     from slide_solver import SlideSolver, SlideSolverConfig  # type: ignore
 
     config = SlideSolverConfig(random_seed=seed)
-    LOG.info("captcha try kind=slide aid=%s", aid)
+    LOG.info("captcha try kind=slide aid=%s aidEncrypted=%s", aid, bool(aid_encrypted))
     with SlideSolver(
         proxy=proxy,
         config=config,
@@ -66,37 +73,48 @@ def _solve_slide(proxy: str | None, *, aid: int, retries: int, seed: int | None)
         entry_url=ENTRY_URL,
         entry_referer=ENTRY_REFERER,
     ) as solver:
+        # best-effort: some slide versions may support extra params later
+        if aid_encrypted and hasattr(solver, "session"):
+            pass
         result = solver.solve(retries=retries)
     return _ticket_from_result(result, "slide")
 
 
-def _solve_image(proxy: str | None, *, aid: int, retries: int, seed: int | None) -> CaptchaTicket:
+def _solve_image(
+    proxy: str | None,
+    *,
+    aid: int,
+    retries: int,
+    seed: int | None,
+    aid_encrypted: str | None = None,
+) -> CaptchaTicket:
     # image_solver expects captcha_runtime (shared helper) on bypass root
     _ensure_path(BYPASS)
     _ensure_path(BYPASS / "image")
     try:
-        import captcha_runtime  # noqa: F401
+        from captcha_runtime import CaptchaRuntime, RuntimeConfig  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
             "image solver needs bypass/captcha_runtime.py (missing); skip kind=image"
         ) from exc
     from image_solver import ImageSolver  # type: ignore
 
-    LOG.info("captcha try kind=image aid=%s", aid)
+    LOG.info("captcha try kind=image aid=%s aidEncrypted=%s", aid, bool(aid_encrypted))
+    cfg = RuntimeConfig(random_seed=seed, use_browser_tls=True)
     kwargs: dict[str, Any] = {
         "proxy": proxy,
         "aid": aid,
         "entry_url": ENTRY_URL,
+        "config": cfg,
     }
     try:
         solver = ImageSolver(**kwargs)
     except TypeError:
-        solver = ImageSolver(proxy=proxy)
+        solver = ImageSolver(proxy=proxy, aid=aid, entry_url=ENTRY_URL)
     try:
-        if hasattr(solver, "solve"):
-            result = solver.solve(retries=retries)
-        else:
-            raise RuntimeError("ImageSolver has no solve()")
+        if aid_encrypted and hasattr(solver, "runtime") and hasattr(solver.runtime, "set_aid_encrypted"):
+            solver.runtime.set_aid_encrypted(aid_encrypted)
+        result = solver.solve(retries=retries)
     finally:
         if hasattr(solver, "close"):
             try:
@@ -106,28 +124,39 @@ def _solve_image(proxy: str | None, *, aid: int, retries: int, seed: int | None)
     return _ticket_from_result(result, "image")
 
 
-def _solve_text(proxy: str | None, *, aid: int, retries: int, seed: int | None) -> CaptchaTicket:
+def _solve_text(
+    proxy: str | None,
+    *,
+    aid: int,
+    retries: int,
+    seed: int | None,
+    aid_encrypted: str | None = None,
+) -> CaptchaTicket:
     _ensure_path(BYPASS)
     _ensure_path(BYPASS / "text")
     try:
-        import captcha_runtime  # noqa: F401
+        from captcha_runtime import RuntimeConfig  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
             "text solver needs bypass/captcha_runtime.py (missing); skip kind=text"
         ) from exc
     from text_solver import TextSolver  # type: ignore
 
-    LOG.info("captcha try kind=text aid=%s", aid)
+    LOG.info("captcha try kind=text aid=%s aidEncrypted=%s", aid, bool(aid_encrypted))
+    cfg = RuntimeConfig(random_seed=seed, use_browser_tls=True)
     kwargs: dict[str, Any] = {
         "proxy": proxy,
         "aid": aid,
         "entry_url": ENTRY_URL,
+        "config": cfg,
     }
     try:
         solver = TextSolver(**kwargs)
     except TypeError:
-        solver = TextSolver(proxy=proxy)
+        solver = TextSolver(proxy=proxy, aid=aid, entry_url=ENTRY_URL)
     try:
+        if aid_encrypted and hasattr(solver, "runtime") and hasattr(solver.runtime, "set_aid_encrypted"):
+            solver.runtime.set_aid_encrypted(aid_encrypted)
         result = solver.solve(retries=retries)
     finally:
         if hasattr(solver, "close"):
@@ -155,18 +184,26 @@ def solve_tencent_captcha(
     retries: int = 2,
     seed: int | None = None,
     kinds: list[str] | None = None,
+    aid_encrypted: str | None = None,
 ) -> CaptchaTicket:
     """Try available local solvers until one returns a ticket.
 
     kinds: optional subset of ["slide","image","text"]. Default: all.
+    aid_encrypted: Bohrium /api/captcha/encrypt_appid signAppIdStr (browser parity).
     """
-    want = set(kinds or ["slide", "image", "text"])
+    want = set(kinds or ["image", "slide", "text"])
     errors: list[str] = []
     for name, fn in SOLVERS:
         if name not in want:
             continue
         try:
-            ticket = fn(proxy, aid=aid, retries=retries, seed=seed)
+            ticket = fn(
+                proxy,
+                aid=aid,
+                retries=retries,
+                seed=seed,
+                aid_encrypted=aid_encrypted,
+            )
             LOG.info("captcha solved kind=%s ticket_len=%s", ticket.kind, len(ticket.ticket))
             return ticket
         except Exception as exc:  # noqa: BLE001
